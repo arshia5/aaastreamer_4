@@ -1,10 +1,10 @@
-"""XGBoost learning-to-rank reranker.
+"""XGBoost learning-to-rank reranker (v4).
 
-Trained nightly on a chronological split (positives = each user's held-out liked
-movies, negatives = sampled unseen candidates), grouped per user with
-objective rank:ndcg. At serving time the hybrid produces a candidate pool, this
-model reranks it, then diversity is applied. Features are built from the hybrid
-component scores plus movie/user statistics.
+Features combine per-channel similarity to the user's positive/negative taste
+profiles (metadata, plot, community), the collaborative score + its per-user
+percentile, Bayesian popularity (raw + percentile), and structured cross-features
+(favourite/recent-genre match, genre/actor overlap, year distance). Trained on
+graded relevance labels (0–3) with objective rank:ndcg.
 """
 from __future__ import annotations
 
@@ -20,85 +20,103 @@ from app.ml import config
 log = logging.getLogger("recsys.ranker")
 
 FEATURE_NAMES = [
-    "content_n", "collab_n", "pop_n", "content_raw", "collab_raw",
-    "review_count_log", "movie_avg_pref", "user_avg_pref",
-    "user_n_pos_log", "user_has_collab",
-    "genre_overlap", "actor_overlap", "year_distance",
+    "meta_pos", "meta_neg", "meta_gap",
+    "plot_pos", "plot_neg", "plot_gap",
+    "comm_pos", "comm_neg", "comm_gap",
+    "mf", "mf_pct",
+    "pop", "pop_pct", "review_count_log", "movie_avg_pref",
+    "genre_overlap", "fav_genre_match", "recent_genre_match",
+    "actor_overlap", "year_distance",
+    "user_avg_pref", "user_n_pos_log", "has_mf",
 ]
 
 
-def build_user_profile(ctx, liked_idxs):
-    """User taste profile from their liked-movie rows: (liked_genres set,
-    liked_actors set, preferred_year). Used for ranker overlap features."""
-    lg, la, years = set(), set(), []
-    for j in liked_idxs:
-        lg |= ctx.genres[j]
-        la |= ctx.actors[j]
-        if not np.isnan(ctx.year[j]):
-            years.append(float(ctx.year[j]))
-    pref_year = float(np.mean(years)) if years else None
-    return frozenset(lg), frozenset(la), pref_year
+def graded_label(pref: float | None) -> int:
+    """0–3 relevance grade for rank:ndcg (critical hit / good / neutral / none)."""
+    if pref is None:
+        return 0
+    if pref >= 9.0:
+        return 3
+    if pref >= 7.0:
+        return 2
+    if pref >= 5.5:
+        return 1
+    return 0
 
 
-def build_features(ctx, user_unit, user_id, candidates, user_avg_pref, user_n_pos,
-                   profile=None):
-    """Feature matrix (C, 13) for a user's candidate list.
-    candidates: (movie_idx, final, content_n, collab_n, pop_n).
-    profile: (liked_genres, liked_actors, preferred_year) or None."""
-    rows = np.array([c[0] for c in candidates])
-    content_n = np.array([c[2] if c[2] is not None else 0.0 for c in candidates],
-                         dtype=np.float32)
-    collab_n = np.array([c[3] if c[3] is not None else 0.0 for c in candidates],
-                        dtype=np.float32)
-    pop_n = np.array([c[4] for c in candidates], dtype=np.float32)
+def _pct(a: np.ndarray) -> np.ndarray:
+    if len(a) <= 1:
+        return np.zeros_like(a)
+    return a.argsort().argsort().astype(np.float32) / (len(a) - 1)
 
-    if user_unit is not None:
-        content_raw = ctx.content_unit[rows] @ user_unit
+
+def build_features(ctx, uv, cand_idx: np.ndarray) -> np.ndarray:
+    """Feature matrix (C, len(FEATURE_NAMES)) for one user's candidates."""
+    C = len(cand_idx)
+    z = lambda: np.zeros(C, dtype=np.float32)
+
+    def cos(mat, prof):
+        return (mat[cand_idx] @ prof).astype(np.float32) if prof is not None else z()
+
+    meta_pos, meta_neg = cos(ctx.meta, uv.meta_pos), cos(ctx.meta, uv.meta_neg)
+    plot_pos, plot_neg = cos(ctx.plot, uv.plot_pos), cos(ctx.plot, uv.plot_neg)
+
+    comm_pos, comm_neg = z(), z()
+    if uv.comm_pos is not None and ctx.comm_flat.shape[0]:
+        flat_pos = ctx.comm_flat @ uv.comm_pos            # (M_total,) — one matmul
+        flat_neg = ctx.comm_flat @ uv.comm_neg if uv.comm_neg is not None else None
+        off = ctx.comm_off
+        for i, j in enumerate(cand_idx):
+            a, b = off[j], off[j + 1]
+            if b > a:
+                comm_pos[i] = float(flat_pos[a:b].max())
+                if flat_neg is not None:
+                    comm_neg[i] = float(flat_neg[a:b].max())
+
+    if uv.mf is not None:
+        mf = (ctx.mf_item[cand_idx] @ uv.mf).astype(np.float32)
+        mf = np.where(ctx.mf_mask[cand_idx], mf, 0.0)
     else:
-        content_raw = np.zeros(len(rows), dtype=np.float32)
+        mf = z()
+    mf_pct = _pct(mf)
 
-    has_collab = ctx.collab is not None and ctx.collab.has_user(user_id)
-    if has_collab:
-        uf = ctx.collab.user_factors[ctx.collab.user_map[user_id]]
-        collab_raw = ctx.collab_item[rows] @ uf + ctx.collab_bias[rows]
-        collab_raw = np.where(ctx.collab_mask[rows], collab_raw, 0.0)
-    else:
-        collab_raw = np.zeros(len(rows), dtype=np.float32)
+    pop = ctx.pop[cand_idx]
+    pop_pct = _pct(pop)
+    rc_log = np.log1p(ctx.review_count[cand_idx]).astype(np.float32)
+    avgp = ctx.avg_pref[cand_idx]
 
-    rc_log = np.log1p(ctx.review_count[rows])
-    avg_pref = ctx.avg_pref[rows]
+    liked_actors = set()
+    for j in uv.liked_idx:
+        liked_actors |= ctx.actors[j]
+    genre_ov, fav_match, recent_match, actor_ov, year_dist = z(), z(), z(), z(), z()
+    for i, j in enumerate(cand_idx):
+        g = ctx.genres[j]
+        genre_ov[i] = len(g & uv.fav_genres)
+        fav_match[i] = 1.0 if (uv.fav_genre is not None and uv.fav_genre in g) else 0.0
+        recent_match[i] = 1.0 if (uv.last_liked_genres & g) else 0.0
+        actor_ov[i] = len(ctx.actors[j] & liked_actors)
+        yr = ctx.year[j]
+        year_dist[i] = (abs(yr - uv.pref_year)
+                        if (uv.pref_year is not None and not np.isnan(yr)) else np.nan)
 
-    liked_genres, liked_actors, pref_year = profile or (frozenset(), frozenset(), None)
-    genre_ov = np.array([len(ctx.genres[j] & liked_genres) for j in rows], dtype=np.float32)
-    actor_ov = np.array([len(ctx.actors[j] & liked_actors) for j in rows], dtype=np.float32)
-    if pref_year is not None:
-        year_dist = np.array(
-            [abs(ctx.year[j] - pref_year) if not np.isnan(ctx.year[j]) else np.nan
-             for j in rows], dtype=np.float32)
-    else:
-        year_dist = np.full(len(rows), np.nan, dtype=np.float32)  # XGBoost handles NaN
-
-    n = len(rows)
+    n = C
     return np.column_stack([
-        content_n, collab_n, pop_n, content_raw.astype(np.float32),
-        collab_raw.astype(np.float32), rc_log.astype(np.float32),
-        avg_pref.astype(np.float32),
-        np.full(n, user_avg_pref, dtype=np.float32),
-        np.full(n, np.log1p(user_n_pos), dtype=np.float32),
-        np.full(n, 1.0 if has_collab else 0.0, dtype=np.float32),
-        genre_ov, actor_ov, year_dist,
+        meta_pos, meta_neg, meta_pos - meta_neg,
+        plot_pos, plot_neg, plot_pos - plot_neg,
+        comm_pos, comm_neg, comm_pos - comm_neg,
+        mf, mf_pct,
+        pop, pop_pct, rc_log, avgp,
+        genre_ov, fav_match, recent_match,
+        actor_ov, year_dist,
+        np.full(n, uv.avg_pref, np.float32),
+        np.full(n, np.log1p(uv.n_pos), np.float32),
+        np.full(n, 1.0 if uv.mf is not None else 0.0, np.float32),
     ]).astype(np.float32)
 
 
-def train_ranker(X: np.ndarray, y: np.ndarray, qid: np.ndarray):
-    """Train an XGBRanker. Rows must be grouped (sorted) by qid."""
+def train_ranker(X, y, qid):
     from xgboost import XGBRanker
-
-    model = XGBRanker(
-        tree_method="hist",
-        eval_metric="ndcg@10",
-        **config.XGB_PARAMS,
-    )
+    model = XGBRanker(tree_method="hist", eval_metric="ndcg@10", **config.XGB_PARAMS)
     model.fit(X, y, qid=qid)
     return model
 

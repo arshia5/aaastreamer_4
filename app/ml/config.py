@@ -56,6 +56,16 @@ PIPELINE_PATH = ARTIFACTS_DIR / "movie_embed_pipeline.joblib"
 # Default training CSV (the original dataset).
 DEFAULT_MOVIES_CSV = _PROJECT_ROOT.parent / "aaastreamer_3" / "data" / "movies.csv"
 
+# --- v4 component embeddings ---------------------------------------------- #
+# metadata + plot use a stronger sentence transformer (768-d, stateless so new
+# movies are trivial); community uses MiniLM (384-d, fast over ~1.85M reviews).
+TEXT_EMBED_MODEL = "sentence-transformers/all-mpnet-base-v2"
+TEXT_EMBED_DIM = 768
+REVIEW_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+REVIEW_EMBED_DIM = 384
+COMMUNITY_K = 5                 # max KMeans clusters per movie
+COMMUNITY_MAX_REVIEWS = 200     # cap reviews per movie used for clustering
+
 # --- Sentiment model (fine-tuned DistilBERT, 5-class -> 1..10) ------------- #
 SENTIMENT_MODEL_DIR = _PROJECT_ROOT / "models" / "sentiment-distilbert"
 SENTIMENT_MAX_LENGTH = 128
@@ -79,6 +89,12 @@ SIMILAR_TOP_N = 10
 # too few reviews) fall back to content-only.
 SIMILAR_W_CONTENT = 0.7
 SIMILAR_W_COLLAB = 0.3
+# v4 multi-channel similar-movies blend (content-weighted; mf/community fall back
+# to content when missing, e.g. new/sparse movies).
+SIMILAR_W_PLOT = 0.4
+SIMILAR_W_META = 0.3
+SIMILAR_W_MF = 0.2
+SIMILAR_W_COMM = 0.1
 
 # --- Collaborative filtering (PyTorch BPR matrix factorisation) ------------ #
 CF_DIM = 128
@@ -88,6 +104,13 @@ CF_REG = 1e-6                 # L2 on user/item factors (user_alpha == item_alph
 CF_BATCH = 8192
 CF_POS_THRESHOLD = 6.0       # preference >= this counts as a positive
 COLLAB_DIR = ARTIFACTS_DIR / "collaborative"
+
+# --- LightGCN (v4 collaborative model; replaces BPR-MF) ------------------- #
+LIGHTGCN_DIM = 64
+LIGHTGCN_LAYERS = 3
+LIGHTGCN_EPOCHS = 30
+LIGHTGCN_LR = 0.01
+LIGHTGCN_REG = 1e-4
 
 # Real-time fit_partial: kept deliberately small so one odd review only nudges a
 # user's vector rather than re-learning it (the nightly model is the source of
@@ -112,6 +135,13 @@ HYBRID_FB_POP = 0.30
 TOP_N_RECOMMENDATIONS = 100
 # Candidate pool size fed to reranking (XGBoost / diversity).
 CAND_POOL = 200
+
+# --- v4 multi-channel retrieval (union, deduped, ~1000 pool) -------------- #
+RETR_PLOT = 400
+RETR_META = 300
+RETR_MF = 300
+RETR_COMM = 200
+RETR_POP = 100
 
 # --- Diversity (MMR) re-ranking ------------------------------------------- #
 DIVERSITY_ENABLED = True

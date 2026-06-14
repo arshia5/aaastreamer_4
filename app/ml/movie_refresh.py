@@ -1,9 +1,8 @@
-"""Automatic content-embedding + similar-movies refresh for a single movie.
+"""Automatic v4 embedding refresh for a single movie (background task).
 
-Used as a background task so adding/editing a movie (or its genres/cast/etc.)
-keeps its embedding and similar-movies list current without a manual endpoint
-call. Similar movies here are content-only (the movie has no MF item factor yet —
-that is blended in by the nightly job).
+On movie create/edit or a genres/cast/etc. change, regenerate the metadata + plot
+mpnet embeddings (stateless), store them, and refresh the movie's similar list
+(content channels — the movie has no MF/community vector until the nightly run).
 """
 from __future__ import annotations
 
@@ -13,42 +12,41 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import text
 
 from app.core.database import AsyncSessionLocal
+from app.ml import text_embed
 from app.ml.db_records import movie_record_from_db
-from app.ml.embedder import MovieEmbedder, PipelineNotFitted
 from app.ml.similar import update_similar_movies_for
-from app.models import Movie, MovieEmbedding
+from app.models import Movie
 
 log = logging.getLogger("recsys.movie_refresh")
-_LOCK_NS = 42  # advisory-lock namespace for per-movie embedding refreshes
+_LOCK_NS = 42
+
+
+def _embed(record):
+    return text_embed.embed_metadata_one(record), text_embed.embed_plot_one(record)
 
 
 async def regenerate_movie_embedding(movie_id: int) -> None:
     try:
-        embedder = MovieEmbedder.instance()
-    except PipelineNotFitted:
-        log.warning("Embedding pipeline not fitted; skipping movie %s", movie_id)
-        return
-    try:
         async with AsyncSessionLocal() as db:
-            # Serialise concurrent refreshes of the same movie (e.g. create +
-            # several metadata links firing at once) to avoid colliding writes.
             await db.execute(text("SELECT pg_advisory_lock(:ns, :m)"),
                              {"ns": _LOCK_NS, "m": movie_id})
             try:
                 if await db.get(Movie, movie_id) is None:
-                    return  # movie was deleted before this task ran
+                    return
                 record = await movie_record_from_db(db, movie_id)
                 if record is None:
                     return
-                vec = await run_in_threadpool(embedder.embed_one, record)
-                emb = await db.get(MovieEmbedding, movie_id)
-                if emb is None:
-                    db.add(MovieEmbedding(movie_id=movie_id, embedding=vec))
-                else:
-                    emb.embedding = vec
+                meta_vec, plot_vec = await run_in_threadpool(_embed, record)
+                for table, vec in [("movie_metadata_embeddings", meta_vec),
+                                   ("movie_plot_embeddings", plot_vec)]:
+                    await db.execute(
+                        text(f"INSERT INTO {table}(movie_id, embedding) "
+                             f"VALUES (:m, :e) ON CONFLICT (movie_id) "
+                             f"DO UPDATE SET embedding = EXCLUDED.embedding, updated_at = now()"),
+                        {"m": movie_id, "e": str(vec)})
                 await db.commit()
                 await update_similar_movies_for(db, movie_id)
-                log.info("Auto-refreshed embedding + similar for movie %s", movie_id)
+                log.info("Auto-refreshed v4 embeddings + similar for movie %s", movie_id)
             finally:
                 await db.execute(text("SELECT pg_advisory_unlock(:ns, :m)"),
                                  {"ns": _LOCK_NS, "m": movie_id})
@@ -57,6 +55,5 @@ async def regenerate_movie_embedding(movie_id: int) -> None:
 
 
 def schedule_movie_refresh(background_tasks, movie_id: int) -> None:
-    """Queue a background embedding+similar refresh (no-op if no tasks object)."""
     if background_tasks is not None:
         background_tasks.add_task(regenerate_movie_embedding, movie_id)

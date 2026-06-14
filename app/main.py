@@ -1,7 +1,13 @@
-from fastapi import FastAPI
+import asyncio
+import time
+
+import jwt
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
+from app.core.logging_db import log_event
+from app.core.security import decode_access_token
 from app.routers import (
     admin_recs,
     auth,
@@ -29,6 +35,42 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Endpoints too noisy / irrelevant to log.
+_LOG_SKIP_PATHS = {"/health", "/", "/openapi.json", "/docs", "/redoc", "/favicon.ico"}
+
+
+def _user_id_from_request(request: Request) -> int | None:
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return None
+    try:
+        payload = decode_access_token(auth[7:])
+        return int(payload["sub"]) if payload.get("type") == "access" else None
+    except Exception:
+        return None
+
+
+@app.middleware("http")
+async def request_logger(request: Request, call_next):
+    """Log every mutating request (POST/PUT/PATCH/DELETE) to the logs table."""
+    start = time.time()
+    response = await call_next(request)
+    path = request.url.path
+    if request.method != "GET" and path not in _LOG_SKIP_PATHS:
+        asyncio.create_task(log_event(
+            "http_request",
+            user_id=_user_id_from_request(request),
+            entity_type="http",
+            entity_id=path,
+            details={
+                "method": request.method,
+                "path": path,
+                "status": response.status_code,
+                "ms": round((time.time() - start) * 1000, 1),
+            },
+        ))
+    return response
 
 
 @app.get("/", tags=["health"])

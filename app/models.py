@@ -138,6 +138,77 @@ class MovieEmbedding(Base):
     )
 
 
+# --- v4 component embeddings (separate vector spaces) ---------------------- #
+class MovieMetadataEmbedding(Base):
+    __tablename__ = "movie_metadata_embeddings"
+    movie_id: Mapped[int] = mapped_column(
+        ForeignKey("movies.id", ondelete="CASCADE"), primary_key=True)
+    embedding: Mapped[list[float]] = mapped_column(Vector(768), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class MoviePlotEmbedding(Base):
+    __tablename__ = "movie_plot_embeddings"
+    movie_id: Mapped[int] = mapped_column(
+        ForeignKey("movies.id", ondelete="CASCADE"), primary_key=True)
+    embedding: Mapped[list[float]] = mapped_column(Vector(768), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class MovieMfEmbedding(Base):
+    __tablename__ = "movie_mf_embeddings"
+    movie_id: Mapped[int] = mapped_column(
+        ForeignKey("movies.id", ondelete="CASCADE"), primary_key=True)
+    embedding: Mapped[list[float]] = mapped_column(Vector(64), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class UserMfEmbedding(Base):
+    __tablename__ = "user_mf_embeddings"
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    embedding: Mapped[list[float]] = mapped_column(Vector(64), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class MovieCommunityEmbedding(Base):
+    __tablename__ = "movie_community_embeddings"
+    __table_args__ = (PrimaryKeyConstraint("movie_id", "cluster_idx"),)
+    movie_id: Mapped[int] = mapped_column(
+        ForeignKey("movies.id", ondelete="CASCADE"), nullable=False)
+    cluster_idx: Mapped[int] = mapped_column(Integer, nullable=False)
+    weight: Mapped[float] = mapped_column(Double, nullable=False, server_default="1.0")
+    embedding: Mapped[list[float]] = mapped_column(Vector(384), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class UserProfile768(Base):
+    __tablename__ = "user_profiles_768"
+    __table_args__ = (PrimaryKeyConstraint("user_id", "kind"),)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(768), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class UserProfile384(Base):
+    __tablename__ = "user_profiles_384"
+    __table_args__ = (PrimaryKeyConstraint("user_id", "kind"),)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(384), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
 class UserEmbedding(Base):
     __tablename__ = "user_embeddings"
 

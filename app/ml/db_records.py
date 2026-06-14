@@ -65,6 +65,7 @@ async def movie_record_from_db(db: AsyncSession, movie_id: int) -> dict | None:
             by_role[key].append(person_name)
 
     return {
+        "title": movie.movie_title,
         "plot": movie.plot or "",
         "genre": list(genres),
         "director": by_role["director"],

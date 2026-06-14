@@ -1,9 +1,12 @@
+import asyncio
 from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import or_, select
+
+from app.core.logging_db import log_event
 
 from app.core.security import (
     create_access_token,
@@ -57,6 +60,8 @@ async def _issue_tokens(db, user: User) -> TokenPair:
         )
     )
     await db.commit()
+    asyncio.create_task(log_event(
+        "user_login", user_id=user.id, entity_type="user", entity_id=user.id))
     return TokenPair(
         access_token=create_access_token(user.id),
         refresh_token=raw_refresh,
@@ -85,6 +90,9 @@ async def register(payload: UserCreate, db: DB):
     db.add(user)
     await db.commit()
     await db.refresh(user)
+    asyncio.create_task(log_event(
+        "user_registered", user_id=user.id, entity_type="user", entity_id=user.id,
+        details={"username": user.username}))
     return user
 
 

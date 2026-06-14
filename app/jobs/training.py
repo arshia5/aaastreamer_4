@@ -1,19 +1,10 @@
-"""Full recommendation training job (nightly or admin-triggered).
+"""Full recommendation training job (v4): LightGCN + multi-channel retrieval +
+graded XGBoost ranker + staged evaluation + NDCG@10 rollback.
 
-Pipeline:
-  1. acquire advisory lock (no concurrent trainings)
-  2. recompute movie_popularity_stats
-  3. chronological split (hold out each user's newest review)
-  4. recompute user_embeddings from the train split
-  5. train collaborative MF on train positives -> save artifact (atomic)
-  6. train XGBoost ranker on the train split
-  7. evaluate the NEW pipeline and the CURRENT ACTIVE pipeline on the same
-     held-out reviews; activate the new models only if NDCG@10 improves (rollback)
-  8. if activated, refresh user_recommendations (XGB rerank + diversity)
-  9. record status + metrics in recommendation_jobs
-
-Heavy; runs outside the request lifecycle. Real-time partial_fit only mutates the
-in-memory active model and never writes artifacts, so it can't corrupt training.
+Steps: advisory lock -> popularity -> chronological split (leave-last-k) ->
+LightGCN -> v4 context (with the new MF) -> per-user taste profiles -> XGBoost
+(graded labels) -> staged eval -> rollback gate -> on activation: persist
+artifacts + MF vectors to DB + refresh recommendations.
 """
 from __future__ import annotations
 
@@ -26,14 +17,18 @@ from datetime import datetime, timezone
 import asyncpg
 import numpy as np
 from pgvector.asyncpg import register_vector
+from tqdm import tqdm
 
 from app.core.config import settings
+from app.core.logging_db import log_pg
 from app.ml import config
-from app.ml.collaborative import CollaborativeModel, save_artifact, train_bpr
+from app.ml.collaborative import save_artifact
 from app.ml.evaluation import _ndcg
-from app.ml.hybrid import RecoContext, _minmax, iter_user_candidates, mmr_rerank
-from app.ml.ranker import XgbRanker, build_features, save_ranker, train_ranker
-from app.ml.user_embedding import compute_user_vector
+from app.ml.lightgcn import train_lightgcn
+from app.ml.popularity import _RECOMPUTE_SQL
+from app.ml.profiles import build_user_vectors
+from app.ml.ranker import XgbRanker, build_features, graded_label, save_ranker, train_ranker
+from app.ml.reco import build_context_from_conn, generate_candidates, mmr_rerank
 
 log = logging.getLogger("recsys.training")
 _LOCK_KEY = 911001
@@ -47,27 +42,15 @@ def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def _l2norm_rows(mat):
-    n = np.linalg.norm(mat, axis=1, keepdims=True)
-    n[n == 0] = 1.0
-    return mat / n
-
-
-async def _active_path(conn, model_type):
+async def _active(conn, mtype, field="artifact_path"):
     return await conn.fetchval(
-        "SELECT artifact_path FROM model_versions "
-        "WHERE model_type=$1 AND is_active ORDER BY created_at DESC LIMIT 1",
-        model_type,
-    )
+        f"SELECT {field} FROM model_versions WHERE model_type=$1 AND is_active "
+        f"ORDER BY created_at DESC LIMIT 1", mtype)
 
 
 async def run_full_recommendation_training(
-    *,
-    job_id: int | None = None,
-    triggered_by_user_id: int | None = None,
-    like_threshold: float = 7.0,
-    max_refresh_users: int | None = None,
-    epochs: int = config.CF_EPOCHS,
+    *, job_id=None, triggered_by_user_id=None, like_threshold=7.0,
+    max_refresh_users=None, epochs=None,
 ) -> dict:
     t0 = time.time()
     conn = await asyncpg.connect(_dsn())
@@ -75,404 +58,325 @@ async def run_full_recommendation_training(
     if not await conn.fetchval("SELECT pg_try_advisory_lock($1)", _LOCK_KEY):
         await conn.close()
         return {"status": "skipped", "reason": "another training already running"}
-
     if job_id is None:
         job_id = await conn.fetchval(
             "INSERT INTO recommendation_jobs(job_type, status, started_at, triggered_by_user_id) "
-            "VALUES('full_training','running',$1,$2) RETURNING id",
-            _now(), triggered_by_user_id,
-        )
+            "VALUES('full_training','running',$1,$2) RETURNING id", _now(), triggered_by_user_id)
     else:
-        await conn.execute(
-            "UPDATE recommendation_jobs SET status='running', started_at=$1 WHERE id=$2",
-            _now(), job_id,
-        )
-    # We hold the advisory lock, so any other running/queued training is stale
-    # (its process died without cleanup). Mark those failed.
+        await conn.execute("UPDATE recommendation_jobs SET status='running', started_at=$1 WHERE id=$2",
+                           _now(), job_id)
     await conn.execute(
         "UPDATE recommendation_jobs SET status='failed', finished_at=$1, "
-        "error_message='stale: superseded (process died before completion)' "
-        "WHERE job_type='full_training' AND status IN ('running','queued') AND id <> $2",
-        _now(), job_id,
-    )
-    log.info("Full training job %s started", job_id)
+        "error_message='stale: superseded' WHERE job_type='full_training' "
+        "AND status IN ('running','queued') AND id <> $2", _now(), job_id)
+    log.info("v4 training job %s started", job_id)
+    await log_pg(conn, "training_started", user_id=triggered_by_user_id,
+                 entity_type="job", entity_id=job_id)
     metrics: dict = {}
     try:
-        # --- arrays ------------------------------------------------------ #
         ts = time.time()
-        from app.ml.popularity import _RECOMPUTE_SQL
         await conn.execute(_RECOMPUTE_SQL.text)
         metrics["popularity_seconds"] = round(time.time() - ts, 1)
 
-        erows = await conn.fetch("SELECT movie_id, embedding FROM movie_embeddings")
-        ids = np.array([r["movie_id"] for r in erows], dtype=np.int64)
-        mat = np.array([np.asarray(r["embedding"], dtype=np.float32) for r in erows],
-                       dtype=np.float32)
-        idx = {int(m): i for i, m in enumerate(ids)}
-        emb_lookup = {int(m): mat[i] for i, m in enumerate(ids)}
-        content_unit = _l2norm_rows(mat)
-        pop = np.zeros(len(ids), dtype=np.float32)
-        rc = np.zeros(len(ids), dtype=np.float32)
-        ap = np.full(len(ids), 5.0, dtype=np.float32)
-        for mid, p, cnt, avgp in await conn.fetch(
-            "SELECT movie_id, popularity_score, review_count, avg_preference_score "
-            "FROM movie_popularity_stats"
-        ):
-            if mid in idx:
-                j = idx[mid]
-                pop[j] = p or 0.0
-                rc[j] = cnt or 0
-                ap[j] = avgp if avgp is not None else 5.0
-        # Bayesian-shrink avg preference for the ranker feature (matches the
-        # popularity_score shrinkage): (PRIOR*global_mean + sum) / (PRIOR + n).
-        m_global = float(np.nansum(ap * rc) / max(float(np.nansum(rc)), 1.0))
-        C = config.POPULARITY_PRIOR
-        ap = ((C * m_global + ap * rc) / (C + rc)).astype(np.float32)
-        genres = [set() for _ in ids]
-        for mid, gid in await conn.fetch("SELECT movie_id, genre_id FROM movie_genres"):
-            if mid in idx:
-                genres[idx[mid]].add(gid)
-        # year + actor sets (for ranker overlap/distance features)
-        year = np.full(len(ids), np.nan, dtype=np.float32)
-        for mid, yr in await conn.fetch("SELECT id, year FROM movies WHERE year IS NOT NULL"):
-            if mid in idx:
-                year[idx[mid]] = yr
-        actors = [set() for _ in ids]
-        for mid, pid in await conn.fetch(
-            "SELECT mp.movie_id, mp.person_id FROM movie_people mp "
-            "JOIN roles r ON r.id = mp.role_id WHERE r.name = 'actor'"
-        ):
-            if mid in idx:
-                actors[idx[mid]].add(pid)
+        # refresh community clusters for movies with new reviews (uses stored
+        # review vectors, no re-embedding)
+        from app.ml.community import rebuild_dirty_community
+        ts = time.time()
+        metrics["community_movies_rebuilt"] = await rebuild_dirty_community(conn)
+        metrics["community_seconds"] = round(time.time() - ts, 1)
 
-        # --- chronological split ---------------------------------------- #
+        # --- chronological split (leave-last-k = newest 20%, min 1) ------- #
         rows = await conn.fetch(
-            "SELECT user_id, movie_id, preference_score, review_date "
-            "FROM interactions WHERE preference_score IS NOT NULL "
-            "ORDER BY user_id, review_date NULLS FIRST"
-        )
+            "SELECT user_id, movie_id, preference_score, review_date FROM interactions "
+            "WHERE preference_score IS NOT NULL ORDER BY user_id, review_date NULLS FIRST")
         per_user: dict[int, list] = {}
         for r in rows:
             per_user.setdefault(r["user_id"], []).append(
-                (r["movie_id"], float(r["preference_score"]), r["review_date"])
-            )
+                (r["movie_id"], float(r["preference_score"]), r["review_date"]))
         train_items, test_items = {}, {}
         for uid, items in per_user.items():
             if len(items) >= 2:
-                train_items[uid] = items[:-1]
-                test_items[uid] = [items[-1]]
+                k = max(1, round(0.2 * len(items)))
+                train_items[uid], test_items[uid] = items[:-k], items[-k:]
             else:
                 train_items[uid] = items
         metrics["users"] = len(per_user)
 
-        # per-user stats (for ranker features)
-        user_avg_pref, user_n_pos = {}, {}
-        for uid, items in train_items.items():
-            prefs = [p for _, p, _ in items]
-            user_avg_pref[uid] = float(np.mean(prefs)) if prefs else 5.0
-            user_n_pos[uid] = sum(1 for p in prefs if p >= config.CF_POS_THRESHOLD)
-
-        # --- user embeddings (train split) ------------------------------ #
-        ts = time.time()
-        user_unit: dict[int, np.ndarray] = {}
-        ue_records = []
-        for uid, items in train_items.items():
-            vec = compute_user_vector(items, emb_lookup)
-            if vec is not None and np.linalg.norm(vec) > 0:
-                user_unit[uid] = vec
-                ue_records.append((uid, vec))
-        await conn.execute("DROP TABLE IF EXISTS _stg_ue")
-        await conn.execute("CREATE TEMP TABLE _stg_ue(user_id int, embedding vector(%d))"
-                           % config.N_COMPONENTS)
-        await conn.copy_records_to_table("_stg_ue", records=ue_records,
-                                         columns=["user_id", "embedding"])
-        await conn.execute(
-            "INSERT INTO user_embeddings(user_id, embedding) "
-            "SELECT user_id, embedding FROM _stg_ue "
-            "ON CONFLICT (user_id) DO UPDATE SET embedding=EXCLUDED.embedding, updated_at=now()")
-        await conn.execute("DROP TABLE _stg_ue")
-        metrics["user_embeddings"] = len(ue_records)
-        metrics["user_embed_seconds"] = round(time.time() - ts, 1)
-
-        # --- train collaborative MF ------------------------------------- #
+        # --- LightGCN ----------------------------------------------------- #
         ts = time.time()
         user_map, item_map = {}, {}
-        u_list, i_list, w_list = [], [], []
+        pu, pi = [], []
         for uid, items in train_items.items():
             for mid, pref, _ in items:
-                if pref < config.CF_POS_THRESHOLD or mid not in idx:
+                if pref < config.CF_POS_THRESHOLD:
                     continue
-                ui = user_map.setdefault(uid, len(user_map))
-                ii = item_map.setdefault(mid, len(item_map))
-                u_list.append(ui); i_list.append(ii); w_list.append(pref / 10.0)
-        uf, itf, ib, losses = train_bpr(
-            np.array(u_list), np.array(i_list), np.array(w_list, dtype=np.float32),
-            len(user_map), len(item_map), epochs=epochs)
-        metrics.update(cf_positives=len(u_list), cf_users=len(user_map),
-                       cf_items=len(item_map),
-                       cf_final_loss=round(losses[-1], 4) if losses else None,
+                pu.append(user_map.setdefault(uid, len(user_map)))
+                pi.append(item_map.setdefault(mid, len(item_map)))
+        kw = {"epochs": epochs} if epochs else {}
+        user_emb, item_emb, losses = train_lightgcn(
+            np.array(pu), np.array(pi), len(user_map), len(item_map), **kw)
+        metrics.update(cf_users=len(user_map), cf_items=len(item_map),
+                       cf_edges=len(pu), cf_final_loss=round(losses[-1], 4),
                        cf_train_seconds=round(time.time() - ts, 1))
-        cf_version, cf_path = save_artifact(
-            uf, itf, ib, user_map, item_map,
-            {"dim": config.CF_DIM, "epochs": epochs})
-        new_collab = CollaborativeModel(
-            {"user_factors": uf, "item_factors": itf, "item_bias": ib,
-             "user_map": user_map, "item_map": item_map, "meta": {}}, path=cf_path)
-        new_ctx = RecoContext(ids, content_unit, idx, pop, new_collab,
-                              review_count=rc, avg_pref=ap, genres=genres,
-                              year=year, actors=actors, active_version=cf_version)
 
-        # per-user taste profiles for ranker overlap features
-        from app.ml.ranker import build_user_profile
-        user_profiles = {}
-        for uid, items in train_items.items():
-            liked = [idx[mid] for mid, pref, _ in items
-                     if pref >= config.CF_POS_THRESHOLD and mid in idx]
-            user_profiles[uid] = build_user_profile(new_ctx, liked)
+        # --- v4 context with the NEW mf ---------------------------------- #
+        ctx = await build_context_from_conn(conn)
+        n = len(ctx.ids)
+        mf_item = np.zeros((n, config.LIGHTGCN_DIM), dtype=np.float32)
+        mf_mask = np.zeros(n, dtype=bool)
+        for mid, row in item_map.items():
+            j = ctx.idx.get(mid)
+            if j is not None:
+                mf_item[j] = item_emb[row]
+                mf_mask[j] = True
+        ctx.mf_item, ctx.mf_mask = mf_item, mf_mask
+        user_mf = {uid: user_emb[row] for uid, row in user_map.items()}
 
-        # current active models (for rollback comparison) — loaded BEFORE activation
-        old_cf_path = await _active_path(conn, "collaborative_mf")
-        old_xgb_path = await _active_path(conn, "xgb_ranker")
-        old_collab = CollaborativeModel.load(old_cf_path) if old_cf_path else None
-        old_ranker = XgbRanker.load(old_xgb_path) if old_xgb_path else None
-        old_ctx = (RecoContext(ids, content_unit, idx, pop, old_collab,
-                               review_count=rc, avg_pref=ap, genres=genres,
-                               year=year, actors=actors)
-                   if old_collab is not None else None)
-
-        # insert new model_versions rows (inactive until rollback check passes)
-        cf_mv = await conn.fetchval(
-            "INSERT INTO model_versions(model_type, version_name, artifact_path, is_active) "
-            "VALUES('collaborative_mf',$1,$2,false) RETURNING id", cf_version, cf_path)
-
-        # --- train XGBoost ranker --------------------------------------- #
+        # --- per-user taste vectors -------------------------------------- #
         ts = time.time()
-        X, y, qid = _build_xgb_data(new_ctx, user_unit, train_items, test_items,
-                                    user_avg_pref, user_n_pos, user_profiles,
-                                    like_threshold, config.XGB_TRAIN_USERS)
-        new_ranker = None
-        xgb_version = xgb_path = None
-        xgb_mv = None
+        uvecs: dict[int, object] = {}
+        for uid, items in tqdm(train_items.items(), total=len(train_items),
+                               desc="profiles", mininterval=5):
+            uv = build_user_vectors(ctx, items, ctx.global_mean)
+            uv.mf = user_mf.get(uid)
+            uvecs[uid] = uv
+        metrics["profiles_seconds"] = round(time.time() - ts, 1)
+
+        # --- XGBoost ranker (graded) ------------------------------------- #
+        ts = time.time()
+        X, y, qid = _build_xgb_data(ctx, uvecs, train_items, test_items, like_threshold)
+        ranker = None
         if X is not None and len(set(qid)) >= 50:
-            model = train_ranker(X, y, qid)
-            new_ranker = XgbRanker({"model": model})
-            xgb_version, xgb_path = save_ranker(model, {"rows": int(len(y))})
-            xgb_mv = await conn.fetchval(
-                "INSERT INTO model_versions(model_type, version_name, artifact_path, is_active) "
-                "VALUES('xgb_ranker',$1,$2,false) RETURNING id", xgb_version, xgb_path)
-            metrics["xgb_rows"] = int(len(y))
-            metrics["xgb_groups"] = int(len(set(qid)))
+            ranker = XgbRanker({"model": train_ranker(X, y, qid)})
+            metrics.update(xgb_rows=int(len(y)), xgb_groups=int(len(set(qid))))
         metrics["xgb_train_seconds"] = round(time.time() - ts, 1)
 
-        # --- evaluate new vs old (same held-out) ------------------------ #
+        # --- staged evaluation ------------------------------------------- #
         ts = time.time()
-        new_metrics = _evaluate(new_ctx, new_ranker, user_unit, train_items,
-                                test_items, user_avg_pref, user_n_pos,
-                                user_profiles, like_threshold)
-        old_metrics = (_evaluate(old_ctx, old_ranker, user_unit, train_items,
-                                 test_items, user_avg_pref, user_n_pos,
-                                 user_profiles, like_threshold)
-                       if old_ctx is not None else None)
+        ev = _evaluate(ctx, ranker, uvecs, train_items, test_items, like_threshold)
+        metrics["eval"] = ev
         metrics["eval_seconds"] = round(time.time() - ts, 1)
-        metrics["new_model"] = new_metrics
-        metrics["old_model"] = old_metrics
 
-        # --- rollback decision ------------------------------------------ #
-        m = config.ROLLBACK_METRIC
-        if old_metrics is None:
-            activate = True
-        else:
-            activate = new_metrics[m] >= old_metrics[m] + config.ROLLBACK_MARGIN
-        metrics["rollback_metric"] = m
+        # --- rollback vs active stored ndcg ------------------------------ #
+        old_ndcg = await conn.fetchval(
+            "SELECT (metrics->>'ndcg_at_10')::float FROM model_versions "
+            "WHERE model_type='lightgcn' AND is_active ORDER BY created_at DESC LIMIT 1")
+        new_ndcg = ev["ndcg_at_10"]
+        activate = old_ndcg is None or new_ndcg >= old_ndcg + config.ROLLBACK_MARGIN
         metrics["decision"] = "activated" if activate else "rolled_back"
-        log.info("Job %s decision=%s (new %s=%.4f vs old %s)", job_id,
-                 metrics["decision"], m, new_metrics[m],
-                 f"{old_metrics[m]:.4f}" if old_metrics else "none")
+        metrics["new_ndcg_at_10"] = new_ndcg
+        metrics["old_ndcg_at_10"] = old_ndcg
+        await log_pg(conn, "model_activated" if activate else "model_rolled_back",
+                     entity_type="model", details={"ndcg_at_10": new_ndcg, "old": old_ndcg})
 
         if activate:
-            await conn.execute("UPDATE model_versions SET is_active=false "
-                               "WHERE model_type='collaborative_mf'")
-            await conn.execute("UPDATE model_versions SET is_active=true WHERE id=$1", cf_mv)
-            await conn.execute("UPDATE model_versions SET metrics=$1 WHERE id=$2",
-                               json.dumps(new_metrics), cf_mv)
-            if xgb_mv is not None:
-                await conn.execute("UPDATE model_versions SET is_active=false "
-                                   "WHERE model_type='xgb_ranker'")
-                await conn.execute("UPDATE model_versions SET is_active=true, metrics=$1 "
-                                   "WHERE id=$2", json.dumps(new_metrics), xgb_mv)
+            cf_version, cf_path = save_artifact(
+                user_emb, item_emb, np.zeros(len(item_map), np.float32),
+                user_map, item_map, {"model": "lightgcn", "dim": config.LIGHTGCN_DIM})
+            xgb_version, xgb_path = (save_ranker(ranker.model, {"features": len(X[0])})
+                                     if ranker else (None, None))
+            await conn.execute("UPDATE model_versions SET is_active=false WHERE model_type IN ('lightgcn','xgb_ranker')")
+            await conn.execute(
+                "INSERT INTO model_versions(model_type, version_name, artifact_path, is_active, metrics) "
+                "VALUES('lightgcn',$1,$2,true,$3)", cf_version, cf_path, json.dumps(ev))
+            if xgb_path:
+                await conn.execute(
+                    "INSERT INTO model_versions(model_type, version_name, artifact_path, is_active, metrics) "
+                    "VALUES('xgb_ranker',$1,$2,true,$3)", xgb_version, xgb_path, json.dumps(ev))
+            await _store_mf(conn, ctx, item_map, item_emb, user_map, user_emb)
             ts = time.time()
-            refreshed = await _refresh_all(conn, new_ctx, new_ranker, user_unit,
-                                           user_avg_pref, user_n_pos, user_profiles,
-                                           max_refresh_users)
+            refreshed = await _refresh_all(conn, ctx, ranker, uvecs, train_items,
+                                           test_items, max_refresh_users)
             metrics["recommendations_refreshed"] = refreshed
             metrics["refresh_seconds"] = round(time.time() - ts, 1)
-
-            # Rebuild hybrid similar_movies (content-weighted + MF blend) now that
-            # the new collaborative item factors are active.
-            ts = time.time()
+            # rebuild multi-channel similar_movies with the fresh MF/community
             from app.ml.similar import rebuild_similar_hybrid
-            await rebuild_similar_hybrid(conn, ids, content_unit, idx, new_collab)
-            metrics["similar_rebuild_seconds"] = round(time.time() - ts, 1)
-        else:
-            # keep old models active; new artifacts retained but inactive
-            metrics["recommendations_refreshed"] = 0
+            ts = time.time()
+            await rebuild_similar_hybrid(conn, ctx)
+            metrics["similar_seconds"] = round(time.time() - ts, 1)
+            await log_pg(conn, "similar_rebuilt", entity_type="job", entity_id=job_id)
 
         metrics["total_seconds"] = round(time.time() - t0, 1)
-        await conn.execute(
-            "UPDATE recommendation_jobs SET status='success', finished_at=$1, metrics=$2 "
-            "WHERE id=$3", _now(), json.dumps(metrics), job_id)
-        log.info("Job %s succeeded in %.1fs (%s)", job_id,
-                 metrics["total_seconds"], metrics["decision"])
+        await conn.execute("UPDATE recommendation_jobs SET status='success', finished_at=$1, metrics=$2 WHERE id=$3",
+                           _now(), json.dumps(metrics), job_id)
+        await log_pg(conn, "training_completed", user_id=triggered_by_user_id,
+                     entity_type="job", entity_id=job_id,
+                     details={"decision": metrics["decision"], "ndcg_at_10": new_ndcg})
+        log.info("v4 job %s done in %.1fs (%s)", job_id, metrics["total_seconds"], metrics["decision"])
         return {"job_id": job_id, "status": "success", "metrics": metrics}
     except Exception as exc:
-        log.exception("Full training job %s failed", job_id)
-        await conn.execute(
-            "UPDATE recommendation_jobs SET status='failed', finished_at=$1, "
-            "error_message=$2, metrics=$3 WHERE id=$4",
-            _now(), str(exc)[:2000], json.dumps(metrics), job_id)
+        log.exception("v4 training job %s failed", job_id)
+        await conn.execute("UPDATE recommendation_jobs SET status='failed', finished_at=$1, "
+                           "error_message=$2, metrics=$3 WHERE id=$4",
+                           _now(), str(exc)[:2000], json.dumps(metrics), job_id)
         return {"job_id": job_id, "status": "failed", "error": str(exc)}
     finally:
         await conn.execute("SELECT pg_advisory_unlock($1)", _LOCK_KEY)
         await conn.close()
 
 
-def _rerank(ctx, ranker, user_unit, uid, cands, user_avg_pref, user_n_pos, profiles):
-    """Apply XGB ranker to reorder candidates (descending by predicted score)."""
-    if ranker is None or not cands:
-        return cands
-    X = build_features(ctx, user_unit.get(uid), uid, cands,
-                       user_avg_pref.get(uid, 5.0), user_n_pos.get(uid, 0),
-                       profile=profiles.get(uid))
-    # Skip an incompatible ranker (e.g. an older model trained on fewer features);
-    # that side is then evaluated as hybrid-only.
-    if getattr(ranker, "features", None) and len(ranker.features) != X.shape[1]:
-        return cands
-    scores = ranker.predict(X)
-    order = np.argsort(scores)[::-1]
-    return [(*cands[i][:1], float(scores[i]), *cands[i][2:]) for i in order]
+def _rank(ctx, ranker, uv, cand):
+    """Return (cand_idx array, score array) ranked by XGB (or hybrid fallback)."""
+    if len(cand) == 0:
+        return cand, np.array([])
+    if ranker is not None:
+        scores = ranker.predict(build_features(ctx, uv, cand))
+    else:
+        # fallback: plot+meta+mf+pop blend
+        s = ctx.pop[cand].copy()
+        if uv.plot_pos is not None:
+            s = s + (ctx.plot[cand] @ uv.plot_pos)
+        if uv.mf is not None:
+            s = s + np.where(ctx.mf_mask[cand], ctx.mf_item[cand] @ uv.mf, 0)
+        scores = s
+    return cand, np.asarray(scores, dtype=np.float32)
 
 
-def _eval_user_pool(ctx, train_items, test_items, like_threshold, user_unit, sample_n):
-    eval_uids, seen_map, relevant = [], {}, {}
+def _eval_pool(ctx, train_items, test_items, like_threshold, sample_n):
+    uids, seen, rel = [], {}, {}
     for uid, test in test_items.items():
-        if uid not in user_unit:
+        r = {m for m, p, _ in test if p >= like_threshold and m in ctx.idx}
+        if not r:
             continue
-        rel = {m for m, pref, _ in test if pref >= like_threshold and m in ctx.idx}
-        if not rel:
-            continue
-        eval_uids.append(uid)
-        seen_map[uid] = [ctx.idx[m] for m, _, _ in train_items.get(uid, []) if m in ctx.idx]
-        relevant[uid] = rel
+        uids.append(uid)
+        seen[uid] = [ctx.idx[m] for m, _, _ in train_items.get(uid, []) if m in ctx.idx]
+        rel[uid] = r
+    random.Random(42).shuffle(uids)
+    return uids[:sample_n], seen, rel
+
+
+def _build_xgb_data(ctx, uvecs, train_items, test_items, like_threshold):
+    uids, seen, rel = _eval_pool(ctx, train_items, test_items, like_threshold,
+                                 config.XGB_TRAIN_USERS)
+    pref_of = {uid: {m: p for m, p, _ in test_items[uid]} for uid in uids}
+    Xs, ys, qids, g = [], [], [], 0
     rng = random.Random(42)
-    rng.shuffle(eval_uids)
-    eval_uids = eval_uids[:sample_n]
-    return eval_uids, seen_map, relevant
-
-
-def _evaluate(ctx, ranker, user_unit, train_items, test_items,
-              user_avg_pref, user_n_pos, profiles, like_threshold, k=10):
-    eval_uids, seen_map, relevant = _eval_user_pool(
-        ctx, train_items, test_items, like_threshold, user_unit,
-        config.EVAL_SAMPLE_USERS)
-    pop_order = np.argsort(ctx.pop)[::-1]
-    n = 0
-    hr = prec = r10 = r50 = ndcg = bhr = 0.0
-    for uid, cands in iter_user_candidates(ctx, eval_uids, user_unit, seen_map):
-        rel = relevant[uid]
-        cands = _rerank(ctx, ranker, user_unit, uid, cands, user_avg_pref,
-                        user_n_pos, profiles)
-        div = mmr_rerank(ctx, cands, 50)
-        rec = [int(ctx.ids[c[0]]) for c in div]
-        rels10 = [1 if m in rel else 0 for m in rec[:k]]
-        hits10 = sum(rels10)
-        hits50 = sum(1 for m in rec[:50] if m in rel)
-        n += 1
-        hr += 1.0 if hits10 else 0.0
-        prec += hits10 / k
-        r10 += hits10 / len(rel)
-        r50 += hits50 / len(rel)
-        ndcg += _ndcg(rels10, len(rel), k)
-        seen_set = set(seen_map[uid])
-        brec = [int(ctx.ids[j]) for j in pop_order if j not in seen_set][:k]
-        bhr += 1.0 if any(m in rel for m in brec) else 0.0
-    a = (lambda x: x / n if n else 0.0)
-    return {"eval_users": n, "hit_rate_at_10": a(hr), "precision_at_10": a(prec),
-            "recall_at_10": a(r10), "recall_at_50": a(r50), "ndcg_at_10": a(ndcg),
-            "baseline_pop_hit_rate_at_10": a(bhr)}
-
-
-def _build_xgb_data(ctx, user_unit, train_items, test_items,
-                    user_avg_pref, user_n_pos, profiles, like_threshold, sample_n):
-    uids, seen_map, relevant = _eval_user_pool(
-        ctx, train_items, test_items, like_threshold, user_unit, sample_n)
-    if not uids:
-        return None, None, None
-    X_parts, y_parts, qid_parts = [], [], []
-    g = 0
-    for uid, cands in iter_user_candidates(ctx, uids, user_unit, seen_map):
-        rel = relevant[uid]
-        labels = np.array([1 if int(ctx.ids[c[0]]) in rel else 0 for c in cands])
-        if labels.sum() == 0:          # no retrieved positive -> no ranking signal
+    for uid in tqdm(uids, desc="xgb-data", mininterval=5):
+        uv = uvecs.get(uid)
+        if uv is None:
             continue
-        feats = build_features(ctx, user_unit.get(uid), uid, cands,
-                               user_avg_pref.get(uid, 5.0), user_n_pos.get(uid, 0),
-                               profile=profiles.get(uid))
-        X_parts.append(feats)
-        y_parts.append(labels)
-        qid_parts.append(np.full(len(cands), g))
+        cand = generate_candidates(ctx, uv, seen[uid])
+        pool = cand.tolist()
+        pool_set = set(pool)
+        # ensure held-out positives are present
+        pos_idx = [ctx.idx[m] for m in rel[uid] if ctx.idx[m] in ctx.idx]
+        labels_of = {j: graded_label(pref_of[uid].get(int(ctx.ids[j]))) for j in pool}
+        for pj in pos_idx:
+            if pj not in pool_set:
+                pool.append(pj); pool_set.add(pj)
+            labels_of[pj] = graded_label(pref_of[uid].get(int(ctx.ids[pj])))
+        positives = [j for j in pool if labels_of.get(j, 0) > 0]
+        if not positives:
+            continue
+        # cap negatives to XGB_NEG_PER_POS per positive (keeps the matrix small)
+        negatives = [j for j in pool if labels_of.get(j, 0) == 0]
+        keep_neg = config.XGB_NEG_PER_POS * len(positives)
+        if len(negatives) > keep_neg:
+            negatives = rng.sample(negatives, keep_neg)
+        group = np.array(positives + negatives, dtype=np.int64)
+        labels = np.array([labels_of.get(int(j), 0) for j in group])
+        Xs.append(build_features(ctx, uv, group))
+        ys.append(labels)
+        qids.append(np.full(len(group), g))
         g += 1
-    if not X_parts:
+    if not Xs:
         return None, None, None
-    return (np.vstack(X_parts), np.concatenate(y_parts), np.concatenate(qid_parts))
+    return np.vstack(Xs), np.concatenate(ys), np.concatenate(qids)
 
 
-async def _refresh_all(conn, ctx, ranker, user_unit, user_avg_pref, user_n_pos,
-                       profiles, max_users):
-    # production "seen" = reviewed OR watched/watchlist
+def _evaluate(ctx, ranker, uvecs, train_items, test_items, like_threshold, k=10):
+    uids, seen, rel = _eval_pool(ctx, train_items, test_items, like_threshold,
+                                 config.EVAL_SAMPLE_USERS)
+    pop_order = np.argsort(ctx.pop)[::-1]
+    buckets = {"1": [0, 0], "2-4": [0, 0], "5-10": [0, 0], "10+": [0, 0]}  # [ndcg_sum, n]
+    n = retr_hit = 0
+    hr = r10 = r50 = ndcg = bhr = 0.0
+    for uid in tqdm(uids, desc="eval", mininterval=5):
+        uv = uvecs[uid]
+        cand = generate_candidates(ctx, uv, seen[uid])
+        if len(cand) == 0:
+            continue
+        retrieved = rel[uid] & {int(ctx.ids[j]) for j in cand}
+        ci, sc = _rank(ctx, ranker, uv, cand)
+        order = np.argsort(sc)[::-1][:50]
+        recs = [int(ctx.ids[ci[o]]) for o in order]
+        rels10 = [1 if m in rel[uid] else 0 for m in recs[:k]]
+        h10 = sum(rels10)
+        n += 1
+        retr_hit += 1 if retrieved else 0
+        hr += 1.0 if h10 else 0.0
+        r10 += h10 / len(rel[uid])
+        r50 += sum(1 for m in recs[:50] if m in rel[uid]) / len(rel[uid])
+        nd = _ndcg(rels10, len(rel[uid]), k)
+        ndcg += nd
+        bhr += 1.0 if any(m in rel[uid] for m in
+                          [int(ctx.ids[j]) for j in pop_order[:k]]) else 0.0
+        nrev = len(train_items.get(uid, []))
+        b = "1" if nrev <= 1 else "2-4" if nrev <= 4 else "5-10" if nrev <= 10 else "10+"
+        buckets[b][0] += nd
+        buckets[b][1] += 1
+    a = (lambda x: round(x / n, 4) if n else 0.0)
+    return {
+        "eval_users": n, "hit_rate_at_10": a(hr), "recall_at_10": a(r10),
+        "recall_at_50": a(r50), "ndcg_at_10": a(ndcg),
+        "retrieval_recall": a(retr_hit), "baseline_pop_hit_rate_at_10": a(bhr),
+        "ndcg_by_reviews": {b: round(s / c, 4) if c else 0.0 for b, (s, c) in buckets.items()},
+    }
+
+
+async def _store_mf(conn, ctx, item_map, item_emb, user_map, user_emb):
+    await conn.execute("TRUNCATE movie_mf_embeddings")
+    await conn.copy_records_to_table(
+        "movie_mf_embeddings",
+        records=[(mid, item_emb[row]) for mid, row in item_map.items() if mid in ctx.idx],
+        columns=["movie_id", "embedding"])
+    await conn.execute("TRUNCATE user_mf_embeddings")
+    await conn.copy_records_to_table(
+        "user_mf_embeddings",
+        records=[(uid, user_emb[row]) for uid, row in user_map.items()],
+        columns=["user_id", "embedding"])
+
+
+async def _refresh_all(conn, ctx, ranker, uvecs, train_items, test_items, max_users):
     seen_map: dict[int, list] = {}
     for uid, mid in await conn.fetch(
         "SELECT user_id, movie_id FROM interactions "
-        "UNION SELECT user_id, movie_id FROM user_movie_states"
-    ):
+        "UNION SELECT user_id, movie_id FROM user_movie_states"):
         if mid in ctx.idx:
             seen_map.setdefault(uid, []).append(ctx.idx[mid])
-
-    uids = list(user_unit.keys())
+    uids = list(uvecs.keys())
     if max_users is not None:
         uids = uids[:max_users]
-
-    # No global TRUNCATE: replace each batch of users' recommendations inside a
-    # short transaction, so the website always sees a complete set for every user
-    # (either their old or their new list) while training runs.
-    batch_uids: list[int] = []
-    records: list[tuple] = []
-    done = 0
+    batch_uids, records, done = [], [], 0
+    pbar = tqdm(total=len(uids), desc="refresh", mininterval=5)
 
     async def flush():
         if not batch_uids:
             return
         async with conn.transaction():
-            await conn.execute(
-                "DELETE FROM user_recommendations WHERE user_id = ANY($1::int[])",
-                batch_uids)
+            await conn.execute("DELETE FROM user_recommendations WHERE user_id = ANY($1::int[])", batch_uids)
             if records:
                 await conn.copy_records_to_table(
                     "user_recommendations", records=records,
                     columns=["user_id", "movie_id", "score", "rank",
                              "content_score", "collaborative_score", "popularity_score"])
 
-    for uid, cands in iter_user_candidates(ctx, uids, user_unit, seen_map):
-        cands = _rerank(ctx, ranker, user_unit, uid, cands, user_avg_pref,
-                        user_n_pos, profiles)
-        div = mmr_rerank(ctx, cands, config.TOP_N_RECOMMENDATIONS)
-        for rank, (j, score, c, cf, pp) in enumerate(div, start=1):
-            records.append((uid, int(ctx.ids[j]), float(score), rank, c, cf, pp))
-        batch_uids.append(uid)
+    for uid in uids:
+        uv = uvecs[uid]
+        cand = generate_candidates(ctx, uv, seen_map.get(uid, []))
+        if len(cand) == 0:
+            batch_uids.append(uid)
+        else:
+            ci, sc = _rank(ctx, ranker, uv, cand)
+            div = mmr_rerank(ctx, ci, sc, config.TOP_N_RECOMMENDATIONS)
+            for rank, (j, score) in enumerate(div, 1):
+                pj = float(ctx.pop[j])
+                records.append((uid, int(ctx.ids[j]), float(score), rank, None, None, pj))
+            batch_uids.append(uid)
         done += 1
-        if len(batch_uids) >= 2000:
-            await flush()
-            batch_uids.clear(); records.clear()
-        if done % 10000 == 0:
-            log.info("  refreshed %d/%d users", done, len(uids))
+        pbar.update(1)
+        if len(batch_uids) >= 1500:
+            await flush(); batch_uids, records = [], []
     await flush()
+    pbar.close()
     return done

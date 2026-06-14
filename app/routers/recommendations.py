@@ -1,6 +1,9 @@
+import asyncio
+
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import delete, select
 
+from app.core.logging_db import log_event
 from app.deps import DB, CurrentAdmin, CurrentUser, PageParams
 from app.models import Movie, SimilarMovie, User, UserRecommendation
 from app.schemas import (
@@ -111,7 +114,12 @@ async def my_recommendation_movies(db: DB, current_user: CurrentUser, page: Page
         .limit(page.limit)
         .offset(page.offset)
     )
-    return (await db.execute(stmt)).scalars().all()
+    movies = (await db.execute(stmt)).scalars().all()
+    asyncio.create_task(log_event(
+        "recommendations_served", user_id=current_user.id,
+        entity_type="recommendation", entity_id=current_user.id,
+        details={"count": len(movies)}))
+    return movies
 
 
 @router.get(

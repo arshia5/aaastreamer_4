@@ -1,110 +1,109 @@
-"""Real-time recommendation updates triggered by a new/updated review.
+"""Real-time recommendation refresh (v4) — same pipeline as nightly.
 
-Fast path (synchronous): recompute the user's content embedding and nudge the
-collaborative model via fit_partial. Slow path (background task): rebuild the
-user's top-N hybrid recommendations. Full training stays nightly/manual.
+On a new/updated review we rebuild that user's top-100 with the full v4 path
+(multi-channel candidates -> XGBoost rerank -> MMR), so daytime recommendations
+match the nightly ranking objective. The user's content profiles are recomputed
+on the fly; the collaborative (LightGCN) user vector is read from the DB (cold
+users simply have none until the next nightly run). Runs in a background task.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 import time
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+import asyncpg
+import numpy as np
+from pgvector.asyncpg import register_vector
 
-from app.core.database import AsyncSessionLocal
+from app.core.config import settings
 from app.ml import config
-from app.ml.hybrid import build_context, refresh_user_recommendations
-from app.ml.user_embedding import compute_user_vector
-from app.models import Interaction, MovieEmbedding, UserEmbedding
+from app.ml.profiles import build_user_vectors
+from app.ml.ranker import XgbRanker, build_features
+from app.ml.reco import build_context, dsn, generate_candidates, mmr_rerank
 
 log = logging.getLogger("recsys.realtime")
 
-
-async def recompute_user_embedding(db: AsyncSession, user_id: int) -> bool:
-    rows = (
-        await db.execute(
-            select(
-                Interaction.movie_id,
-                Interaction.preference_score,
-                Interaction.review_date,
-            ).where(
-                Interaction.user_id == user_id,
-                Interaction.preference_score.is_not(None),
-            )
-        )
-    ).all()
-    if not rows:
-        return False
-    movie_ids = [r[0] for r in rows]
-    embs = (
-        await db.execute(
-            select(MovieEmbedding.movie_id, MovieEmbedding.embedding).where(
-                MovieEmbedding.movie_id.in_(movie_ids)
-            )
-        )
-    ).all()
-    lookup = {mid: vec for mid, vec in embs}
-    vec = compute_user_vector([(r[0], r[1], r[2]) for r in rows], lookup)
-    if vec is None:
-        return False
-    emb = await db.get(UserEmbedding, user_id)
-    if emb is None:
-        db.add(UserEmbedding(user_id=user_id, embedding=vec.tolist()))
-    else:
-        emb.embedding = vec.tolist()
-    await db.commit()
-    return True
+_ranker = None
+_ranker_version = None
+_lock = threading.Lock()
 
 
-async def _update_recs_bg(
-    user_id: int, movie_id: int, preference_score: float | None
-) -> None:
-    """Background: collaborative fit_partial + rebuild this user's top-N recs.
-
-    Building the reco context (movie matrix + model) is cached, so only the very
-    first call after startup pays the load cost — never the API request itself.
-    """
-    try:
-        async with AsyncSessionLocal() as db:
-            ctx = await build_context(db)
+async def _active_ranker(conn):
+    global _ranker, _ranker_version
+    row = await conn.fetchrow(
+        "SELECT version_name, artifact_path FROM model_versions "
+        "WHERE model_type='xgb_ranker' AND is_active ORDER BY created_at DESC LIMIT 1")
+    if row is None:
+        return None
+    with _lock:
+        if _ranker_version != row["version_name"]:
             try:
-                if (
-                    ctx.collab is not None
-                    and preference_score is not None
-                    and preference_score >= config.CF_POS_THRESHOLD
-                    and ctx.collab.has_user(user_id)
-                    and ctx.collab.has_item(movie_id)
-                ):
-                    ok = ctx.collab.partial_fit_user(
-                        user_id, [(movie_id, preference_score / 10.0)]
-                    )
-                    log.info("user %s collab fit_partial=%s", user_id, ok)
+                _ranker = XgbRanker.load(row["artifact_path"])
+                _ranker_version = row["version_name"]
             except Exception:
-                log.warning("collab fit_partial skipped for %s", user_id, exc_info=True)
-            await refresh_user_recommendations(db, user_id, ctx)
-    except Exception:
-        log.exception("Background rec update failed for user %s", user_id)
+                log.warning("Failed to load ranker %s", row["artifact_path"], exc_info=True)
+                return None
+    return _ranker
 
 
-async def handle_new_review(
-    db: AsyncSession,
-    user_id: int,
-    movie_id: int,
-    preference_score: float | None,
-    background_tasks,
-) -> None:
-    """Fast synchronous user-embedding update; defer the heavy collaborative
-    fit_partial + recommendation refresh to a background task."""
-    t0 = time.time()
+async def refresh_user_recs(user_id: int) -> int:
+    """Recompute + persist one user's top-100 with the v4 pipeline."""
+    ctx = await build_context()
+    conn = await asyncpg.connect(dsn())
+    await register_vector(conn)
     try:
-        ok = await recompute_user_embedding(db, user_id)
-        log.info("user %s embedding updated=%s in %.3fs",
-                 user_id, ok, time.time() - t0)
-    except Exception:
-        log.exception("user %s embedding update failed", user_id)
+        rows = await conn.fetch(
+            "SELECT movie_id, preference_score, review_date FROM interactions "
+            "WHERE user_id=$1 AND preference_score IS NOT NULL", user_id)
+        items = [(r["movie_id"], float(r["preference_score"]), r["review_date"]) for r in rows]
+        if not items:
+            return 0
+        uv = build_user_vectors(ctx, items, ctx.global_mean)
+        mf = await conn.fetchval("SELECT embedding FROM user_mf_embeddings WHERE user_id=$1", user_id)
+        uv.mf = np.asarray(mf, dtype=np.float32) if mf is not None else None
 
+        seen = await conn.fetch(
+            "SELECT movie_id FROM interactions WHERE user_id=$1 "
+            "UNION SELECT movie_id FROM user_movie_states WHERE user_id=$1", user_id)
+        seen_idx = [ctx.idx[r["movie_id"]] for r in seen if r["movie_id"] in ctx.idx]
+        cand = generate_candidates(ctx, uv, seen_idx)
+        if len(cand) == 0:
+            return 0
+        ranker = await _active_ranker(conn)
+        if ranker is not None:
+            scores = ranker.predict(build_features(ctx, uv, cand))
+        else:
+            scores = ctx.pop[cand]
+        div = mmr_rerank(ctx, cand, np.asarray(scores, np.float32),
+                         config.TOP_N_RECOMMENDATIONS)
+        async with conn.transaction():
+            await conn.execute("DELETE FROM user_recommendations WHERE user_id=$1", user_id)
+            await conn.copy_records_to_table(
+                "user_recommendations",
+                records=[(user_id, int(ctx.ids[j]), float(s), rank, None, None, float(ctx.pop[j]))
+                         for rank, (j, s) in enumerate(div, 1)],
+                columns=["user_id", "movie_id", "score", "rank",
+                         "content_score", "collaborative_score", "popularity_score"])
+        return len(div)
+    finally:
+        await conn.close()
+
+
+async def _refresh_bg(user_id: int):
+    try:
+        t0 = time.time()
+        k = await refresh_user_recs(user_id)
+        log.info("real-time refreshed %d recs for user %s in %.2fs",
+                 k, user_id, time.time() - t0)
+    except Exception:
+        log.exception("real-time refresh failed for user %s", user_id)
+
+
+async def handle_new_review(db, user_id, movie_id, preference_score, background_tasks):
+    """Schedule a background v4 recommendation refresh for the reviewer."""
     if background_tasks is not None:
-        background_tasks.add_task(
-            _update_recs_bg, user_id, movie_id, preference_score
-        )
+        background_tasks.add_task(_refresh_bg, user_id)
+    else:
+        asyncio.create_task(_refresh_bg(user_id))
