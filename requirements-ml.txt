@@ -1,0 +1,11 @@
+# Embedding-pipeline dependencies (heavier; needed for generating movie vectors).
+# Install on top of requirements.txt:  pip install -r requirements-ml.txt
+sentence-transformers>=3.0
+scikit-learn>=1.4
+pandas>=2.2
+numpy>=1.26
+joblib>=1.3
+# XGBoost learning-to-rank reranker. Needs OpenMP at runtime:
+#   macOS:  brew install libomp
+#   Debian/Ubuntu VPS:  apt-get install -y libgomp1   (usually preinstalled)
+xgboost>=2.1
