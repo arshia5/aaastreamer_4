@@ -1,7 +1,38 @@
-# The aaastreamer Recommender — v4 (from scratch)
+# The aaastreamer Recommender — v5
 
 Every signal, weight, and hyperparameter in the recommendation system, plus how
 training and serving fit together. File references throughout.
+
+---
+
+## v5 changelog (what changed from v4 and why)
+
+v4 regressed against v3 (lift over the popularity baseline fell from ~4.1× to
+~1.5×). A data-driven diagnosis (`scripts/diagnose_*.py`) found the **ranker**,
+not retrieval, was the defect — sorting by the raw LightGCN score alone beat the
+trained 23-feature XGBoost ranker. Root causes & fixes:
+
+1. **LightGCN was undertrained** — 30 full-batch epochs = 30 gradient steps.
+   Bake-off: 30→**400 epochs** lifts mf retrieval recall@300 0.415→0.503 and
+   mf-as-scorer hit@10 +30%. (`LIGHTGCN_EPOCHS`.)
+2. **Ranker trained on a distribution it never sees at serving** — `_build_xgb_data`
+   force-injected held-out positives that retrieval *missed* (low-mf, look like
+   negatives), teaching the ranker to distrust its strongest feature. Now it
+   trains **only on the retrieved candidate distribution**.
+3. **Retrieval budgets were backwards** — plot (recall 0.10) had 400 slots, mf
+   (0.40) had 300. Rebalanced: mf 500, plot 150. Union recall 0.535→0.600.
+4. **New structured-metadata channel** — the v3 block embedding (genre/cast/year),
+   no plot block, added *alongside* mpnet (not replacing it). mpnet+structured
+   beats either alone (0.204 vs 0.180 recall@300). (`app/ml/struct_embed.py`.)
+5. **Ranker A/B** — every full ranker train fits both XGBoost and a mf-centric
+   linear (Ridge) scorer and ships whichever wins NDCG@10 on the held-out split.
+6. **Cadence split** — the ranker's features are invariant to LightGCN's nightly
+   re-basis, so it is trained **once / occasionally**; nightly runs use
+   `--skip-ranker` (LightGCN + profiles + refresh only, frozen ranker reused).
+
+*Known eval caveat:* the ranker's training users overlap the eval users (shared
+`Random(42)` sample) — inherited from v4, so v5-vs-v4 deltas are valid but absolute
+NDCG is mildly optimistic. A disjoint-eval split is the next honesty improvement.
 
 ---
 
@@ -21,8 +52,10 @@ USER vectors
   metadata/plot/community PROFILES  — positive & negative, recency+preference weighted (recomputed on use)
   mf_embedding          64  LightGCN user vector                                 in DB
 
-RETRIEVE  union of per-channel nearest buckets (plot 400 · metadata 300 · mf 300 · community 200 · popular 100), deduped, seen removed  → ~1000 pool
-RANK      XGBoost (graded labels 0–3, rank:ndcg) on 23 features
+  structured metadata  348  v3 blocks (genre/cast/year, no plot), in-memory       complementary to mpnet meta
+
+RETRIEVE  union of per-channel nearest buckets (mf 500 · metadata 300 · structured 300 · community 200 · plot 150 · popular 100), deduped, seen removed  → ~1100 pool
+RANK      A/B winner of {XGBoost graded rank:ndcg, mf-centric linear} on 26 features
 DIVERSIFY MMR (plot-sim, per-genre cap) → top 100  → user_recommendations
 ```
 

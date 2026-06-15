@@ -50,8 +50,14 @@ async def _active(conn, mtype, field="artifact_path"):
 
 async def run_full_recommendation_training(
     *, job_id=None, triggered_by_user_id=None, like_threshold=7.0,
-    max_refresh_users=None, epochs=None,
+    max_refresh_users=None, epochs=None, retrain_ranker=True,
 ) -> dict:
+    """retrain_ranker: when True (initial / on-demand) the XGBoost-vs-linear A/B is
+    run and the winning ranker is persisted. When False (the nightly job) the
+    ranker is NOT retrained — the active ranker is loaded and reused for eval +
+    refresh. The ranker's features are all dot-products / cosines / structured
+    overlaps, which are invariant to LightGCN's nightly re-basis, so a frozen
+    ranker stays valid as the collaborative model is retrained each night."""
     t0 = time.time()
     conn = await asyncpg.connect(_dsn())
     await register_vector(conn)
@@ -142,16 +148,52 @@ async def run_full_recommendation_training(
             uvecs[uid] = uv
         metrics["profiles_seconds"] = round(time.time() - ts, 1)
 
-        # --- XGBoost ranker (graded) ------------------------------------- #
+        # --- rankers (graded) + A/B: XGBoost vs mf-centric linear -------- #
         ts = time.time()
-        X, y, qid = _build_xgb_data(ctx, uvecs, train_items, test_items, like_threshold)
         ranker = None
-        if X is not None and len(set(qid)) >= 50:
-            ranker = XgbRanker({"model": train_ranker(X, y, qid)})
+        ranker_kind = None
+        X = None
+        if not retrain_ranker:
+            # nightly: reuse the frozen active ranker (do not retrain)
+            from app.ml.ranker import load_ranker
+            rpath = await _active(conn, "xgb_ranker", "artifact_path")
+            if rpath:
+                try:
+                    ranker = load_ranker(rpath)
+                    ranker_kind = getattr(ranker, "KIND", "xgboost")
+                except Exception:
+                    log.warning("could not load active ranker %s; eval/refresh "
+                                "will use the hybrid fallback", rpath, exc_info=True)
+            metrics["ranker_kind"] = ranker_kind
+            metrics["ranker_reused"] = True
+            metrics["xgb_train_seconds"] = 0.0
+        else:
+            X, y, qid = _build_xgb_data(ctx, uvecs, train_items, test_items, like_threshold)
+        if retrain_ranker and X is not None and len(set(qid)) >= 50:
+            from app.ml.ranker import (LinearRanker, save_linear_ranker,
+                                       train_linear_ranker)
+            xgb_r = XgbRanker({"model": train_ranker(X, y, qid)})
+            lin_r = LinearRanker({"model": train_linear_ranker(X, y, qid)})
             metrics.update(xgb_rows=int(len(y)), xgb_groups=int(len(set(qid))))
+            # cheap A/B on a small held-out sample to pick the winner
+            ab_n = min(3000, config.EVAL_SAMPLE_USERS)
+            ev_x = _evaluate(ctx, xgb_r, uvecs, train_items, test_items,
+                             like_threshold, sample_n=ab_n)
+            ev_l = _evaluate(ctx, lin_r, uvecs, train_items, test_items,
+                             like_threshold, sample_n=ab_n)
+            metrics["ranker_ab"] = {
+                "sample_users": ab_n,
+                "xgboost_ndcg_at_10": ev_x["ndcg_at_10"],
+                "linear_ndcg_at_10": ev_l["ndcg_at_10"],
+            }
+            if ev_l["ndcg_at_10"] > ev_x["ndcg_at_10"]:
+                ranker, ranker_kind = lin_r, "linear"
+            else:
+                ranker, ranker_kind = xgb_r, "xgboost"
+        metrics["ranker_kind"] = ranker_kind
         metrics["xgb_train_seconds"] = round(time.time() - ts, 1)
 
-        # --- staged evaluation ------------------------------------------- #
+        # --- full staged evaluation on the A/B winner -------------------- #
         ts = time.time()
         ev = _evaluate(ctx, ranker, uvecs, train_items, test_items, like_threshold)
         metrics["eval"] = ev
@@ -173,13 +215,22 @@ async def run_full_recommendation_training(
             cf_version, cf_path = save_artifact(
                 user_emb, item_emb, np.zeros(len(item_map), np.float32),
                 user_map, item_map, {"model": "lightgcn", "dim": config.LIGHTGCN_DIM})
-            xgb_version, xgb_path = (save_ranker(ranker.model, {"features": len(X[0])})
-                                     if ranker else (None, None))
-            await conn.execute("UPDATE model_versions SET is_active=false WHERE model_type IN ('lightgcn','xgb_ranker')")
+            # persist a newly trained ranker only when retrain_ranker=True; the
+            # nightly job reuses the frozen active ranker and leaves it untouched.
+            xgb_path = None
+            if retrain_ranker and ranker is not None:
+                if ranker_kind == "linear":
+                    xgb_version, xgb_path = save_linear_ranker(
+                        ranker.model, {"features": len(X[0]), "kind": "linear"})
+                else:
+                    xgb_version, xgb_path = save_ranker(
+                        ranker.model, {"features": len(X[0]), "kind": "xgboost"})
+            await conn.execute("UPDATE model_versions SET is_active=false WHERE model_type='lightgcn'")
             await conn.execute(
                 "INSERT INTO model_versions(model_type, version_name, artifact_path, is_active, metrics) "
                 "VALUES('lightgcn',$1,$2,true,$3)", cf_version, cf_path, json.dumps(ev))
             if xgb_path:
+                await conn.execute("UPDATE model_versions SET is_active=false WHERE model_type='xgb_ranker'")
                 await conn.execute(
                     "INSERT INTO model_versions(model_type, version_name, artifact_path, is_active, metrics) "
                     "VALUES('xgb_ranker',$1,$2,true,$3)", xgb_version, xgb_path, json.dumps(ev))
@@ -257,14 +308,14 @@ def _build_xgb_data(ctx, uvecs, train_items, test_items, like_threshold):
             continue
         cand = generate_candidates(ctx, uv, seen[uid])
         pool = cand.tolist()
-        pool_set = set(pool)
-        # ensure held-out positives are present
-        pos_idx = [ctx.idx[m] for m in rel[uid] if ctx.idx[m] in ctx.idx]
+        # Label candidates by their held-out preference. We DO NOT force-inject
+        # held-out positives that retrieval missed: at serving the ranker only ever
+        # scores retrieved candidates, so injecting unretrieved positives (which
+        # look like negatives feature-wise, esp. low mf) trains on a distribution
+        # that never occurs and teaches the ranker to distrust its best signal.
+        # Train only on the retrieved distribution; skip users whose positive
+        # wasn't retrieved (nothing to learn to rank for them).
         labels_of = {j: graded_label(pref_of[uid].get(int(ctx.ids[j]))) for j in pool}
-        for pj in pos_idx:
-            if pj not in pool_set:
-                pool.append(pj); pool_set.add(pj)
-            labels_of[pj] = graded_label(pref_of[uid].get(int(ctx.ids[pj])))
         positives = [j for j in pool if labels_of.get(j, 0) > 0]
         if not positives:
             continue
@@ -284,9 +335,10 @@ def _build_xgb_data(ctx, uvecs, train_items, test_items, like_threshold):
     return np.vstack(Xs), np.concatenate(ys), np.concatenate(qids)
 
 
-def _evaluate(ctx, ranker, uvecs, train_items, test_items, like_threshold, k=10):
+def _evaluate(ctx, ranker, uvecs, train_items, test_items, like_threshold, k=10,
+              sample_n=None):
     uids, seen, rel = _eval_pool(ctx, train_items, test_items, like_threshold,
-                                 config.EVAL_SAMPLE_USERS)
+                                 sample_n or config.EVAL_SAMPLE_USERS)
     pop_order = np.argsort(ctx.pop)[::-1]
     buckets = {"1": [0, 0], "2-4": [0, 0], "5-10": [0, 0], "10+": [0, 0]}  # [ndcg_sum, n]
     n = retr_hit = 0

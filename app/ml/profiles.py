@@ -24,6 +24,8 @@ BASELINE_PRIOR = 5  # shrinkage strength for the per-user mean
 class UserVectors:
     meta_pos: np.ndarray | None = None
     meta_neg: np.ndarray | None = None
+    struct_pos: np.ndarray | None = None
+    struct_neg: np.ndarray | None = None
     plot_pos: np.ndarray | None = None
     plot_neg: np.ndarray | None = None
     comm_pos: np.ndarray | None = None
@@ -66,9 +68,12 @@ def build_user_vectors(ctx, items, global_mean: float,
                      last_date=rows[-1][2])
     genre_counts: Counter = Counter()
     liked_years: list[float] = []
+    has_struct = getattr(ctx, "struct", None) is not None
+    sd = ctx.struct.shape[1] if has_struct else 0
     acc = {k: np.zeros(d, dtype=np.float32) for k, d in
            [("meta_pos", 768), ("meta_neg", 768), ("plot_pos", 768),
-            ("plot_neg", 768), ("comm_pos", 384), ("comm_neg", 384)]}
+            ("plot_neg", 768), ("comm_pos", 384), ("comm_neg", 384),
+            ("struct_pos", sd), ("struct_neg", sd)]}
     for rank_from_new, (mid, pref, _) in enumerate(reversed(rows)):
         j = ctx.idx[mid]
         decay = gamma ** rank_from_new
@@ -87,10 +92,14 @@ def build_user_vectors(ctx, items, global_mean: float,
         suffix = "pos" if liked else "neg"
         acc[f"meta_{suffix}"] += w * ctx.meta[j]
         acc[f"plot_{suffix}"] += w * ctx.plot[j]
+        if has_struct and ctx.struct_mask[j]:
+            acc[f"struct_{suffix}"] += w * ctx.struct[j]
         if ctx.comm_mask[j]:
             acc[f"comm_{suffix}"] += w * ctx.comm_mean[j]
 
     uv.meta_pos, uv.meta_neg = _norm(acc["meta_pos"]), _norm(acc["meta_neg"])
+    if has_struct:
+        uv.struct_pos, uv.struct_neg = _norm(acc["struct_pos"]), _norm(acc["struct_neg"])
     uv.plot_pos, uv.plot_neg = _norm(acc["plot_pos"]), _norm(acc["plot_neg"])
     uv.comm_pos, uv.comm_neg = _norm(acc["comm_pos"]), _norm(acc["comm_neg"])
     uv.fav_genre = genre_counts.most_common(1)[0][0] if genre_counts else None

@@ -66,6 +66,18 @@ REVIEW_EMBED_DIM = 384
 COMMUNITY_K = 5                 # max KMeans clusters per movie
 COMMUNITY_MAX_REVIEWS = 200     # cap reviews per movie used for clustering
 
+# --- v5 structured-metadata channel --------------------------------------- #
+# The v3 structured block embedding (genre multi-hot + hashed director/writer/
+# actor/language/country + year), L2-normalised, WITHOUT the plot block. It is a
+# complementary retrieval channel to the mpnet metadata template: structured
+# alone is weaker than mpnet (0.143 vs 0.180 recall@300) but the two together
+# beat either (0.204) because structured preserves exact genre/cast/year matches
+# that the templated prose blurs. Built in-memory from the fitted v3 pipeline
+# artifact (PIPELINE_PATH) at context-build time — no DB table, no migration.
+STRUCT_ENABLED = True
+# block dim = genre_classes(27) + director(64) + writer(64) + actor(128) +
+# language(32) + country(32) + year(1) = 348 (genre width comes from the mlb).
+
 # --- Sentiment model (fine-tuned DistilBERT, 5-class -> 1..10) ------------- #
 SENTIMENT_MODEL_DIR = _PROJECT_ROOT / "models" / "sentiment-distilbert"
 SENTIMENT_MAX_LENGTH = 128
@@ -106,9 +118,13 @@ CF_POS_THRESHOLD = 6.0       # preference >= this counts as a positive
 COLLAB_DIR = ARTIFACTS_DIR / "collaborative"
 
 # --- LightGCN (v4 collaborative model; replaces BPR-MF) ------------------- #
+# epochs: 30 full-batch steps was severely undertrained (mf is the single
+# strongest channel). Bake-off (held-out split) showed 30->400 epochs lifts mf
+# retrieval recall@300 0.415->0.503 and mf-as-scorer hit@10 0.086->0.112;
+# multi-negative sampling (neg_k>1) did not help. See scripts/diagnose_lightgcn.py.
 LIGHTGCN_DIM = 64
 LIGHTGCN_LAYERS = 3
-LIGHTGCN_EPOCHS = 30
+LIGHTGCN_EPOCHS = 400
 LIGHTGCN_LR = 0.01
 LIGHTGCN_REG = 1e-4
 
@@ -136,10 +152,14 @@ TOP_N_RECOMMENDATIONS = 100
 # Candidate pool size fed to reranking (XGBoost / diversity).
 CAND_POOL = 200
 
-# --- v4 multi-channel retrieval (union, deduped, ~1000 pool) -------------- #
-RETR_PLOT = 400
+# --- v5 multi-channel retrieval (union, deduped, ~1100 pool) -------------- #
+# Budgets rebalanced to measured per-channel recall (scripts/diagnose_channels.py):
+#   mf 0.40 (best) | pop 0.18 | meta 0.18 | struct 0.14 | comm 0.16 | plot 0.10 (worst).
+# mf gets the largest budget; plot was over-budgeted at 400 for the weakest recall.
+RETR_PLOT = 150
 RETR_META = 300
-RETR_MF = 300
+RETR_STRUCT = 300            # v5 structured-metadata channel (complementary to meta)
+RETR_MF = 500
 RETR_COMM = 200
 RETR_POP = 100
 

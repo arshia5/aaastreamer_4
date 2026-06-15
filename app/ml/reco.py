@@ -37,6 +37,8 @@ class RecoContext:
         self.ids = None
         self.idx = {}
         self.meta = None          # (N,768) unit
+        self.struct = None        # (N,348) unit — v5 structured-metadata channel
+        self.struct_mask = None
         self.plot = None          # (N,768) unit
         self.mf_item = None       # (N,64)
         self.mf_mask = None       # (N,)
@@ -75,6 +77,14 @@ async def build_context_from_conn(conn, mf_override=None) -> RecoContext:
     n = len(ctx.ids)
     ctx.idx = {int(m): i for i, m in enumerate(ctx.ids)}
     ctx.meta = _l2(np.array([r["embedding"] for r in erows], dtype=np.float32))
+
+    # v5 structured-metadata channel (in-memory, from the fitted v3 pipeline)
+    try:
+        from app.ml.struct_embed import build_struct_matrix
+        ctx.struct, ctx.struct_mask = await build_struct_matrix(conn, ctx.ids)
+    except Exception:
+        log.exception("structured-metadata channel unavailable; continuing without it")
+        ctx.struct, ctx.struct_mask = None, None
 
     plot = np.zeros((n, config.TEXT_EMBED_DIM), dtype=np.float32)
     for r in await conn.fetch("SELECT movie_id, embedding FROM movie_plot_embeddings"):
@@ -194,6 +204,8 @@ def generate_candidates(ctx: RecoContext, uv, seen_idx) -> np.ndarray:
         buckets.append(_topk(ctx.plot @ uv.plot_pos, config.RETR_PLOT))
     if uv.meta_pos is not None:
         buckets.append(_topk(ctx.meta @ uv.meta_pos, config.RETR_META))
+    if uv.struct_pos is not None and ctx.struct is not None:
+        buckets.append(_topk(ctx.struct @ uv.struct_pos, config.RETR_STRUCT, ctx.struct_mask))
     if uv.mf is not None and ctx.mf_mask.any():
         buckets.append(_topk(ctx.mf_item @ uv.mf, config.RETR_MF, ctx.mf_mask))
     if uv.comm_pos is not None and ctx.comm_mask.any():

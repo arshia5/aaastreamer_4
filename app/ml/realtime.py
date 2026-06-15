@@ -20,7 +20,7 @@ from pgvector.asyncpg import register_vector
 from app.core.config import settings
 from app.ml import config
 from app.ml.profiles import build_user_vectors
-from app.ml.ranker import XgbRanker, build_features
+from app.ml.ranker import build_features, load_ranker
 from app.ml.reco import build_context, dsn, generate_candidates, mmr_rerank
 
 log = logging.getLogger("recsys.realtime")
@@ -40,7 +40,7 @@ async def _active_ranker(conn):
     with _lock:
         if _ranker_version != row["version_name"]:
             try:
-                _ranker = XgbRanker.load(row["artifact_path"])
+                _ranker = load_ranker(row["artifact_path"])
                 _ranker_version = row["version_name"]
             except Exception:
                 log.warning("Failed to load ranker %s", row["artifact_path"], exc_info=True)

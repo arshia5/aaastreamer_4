@@ -21,6 +21,7 @@ log = logging.getLogger("recsys.ranker")
 
 FEATURE_NAMES = [
     "meta_pos", "meta_neg", "meta_gap",
+    "struct_pos", "struct_neg", "struct_gap",
     "plot_pos", "plot_neg", "plot_gap",
     "comm_pos", "comm_neg", "comm_gap",
     "mf", "mf_pct",
@@ -59,6 +60,12 @@ def build_features(ctx, uv, cand_idx: np.ndarray) -> np.ndarray:
         return (mat[cand_idx] @ prof).astype(np.float32) if prof is not None else z()
 
     meta_pos, meta_neg = cos(ctx.meta, uv.meta_pos), cos(ctx.meta, uv.meta_neg)
+    struct = getattr(ctx, "struct", None)
+    if struct is not None:
+        struct_pos = cos(struct, uv.struct_pos)
+        struct_neg = cos(struct, uv.struct_neg)
+    else:
+        struct_pos = struct_neg = z()
     plot_pos, plot_neg = cos(ctx.plot, uv.plot_pos), cos(ctx.plot, uv.plot_neg)
 
     comm_pos, comm_neg = z(), z()
@@ -102,6 +109,7 @@ def build_features(ctx, uv, cand_idx: np.ndarray) -> np.ndarray:
     n = C
     return np.column_stack([
         meta_pos, meta_neg, meta_pos - meta_neg,
+        struct_pos, struct_neg, struct_pos - struct_neg,
         plot_pos, plot_neg, plot_pos - plot_neg,
         comm_pos, comm_neg, comm_pos - comm_neg,
         mf, mf_pct,
@@ -121,17 +129,74 @@ def train_ranker(X, y, qid):
     return model
 
 
+# --- mf-centric linear ranker (A/B alternative) --------------------------- #
+# A standardized Ridge fit on the graded labels: a single learned linear blend
+# over the same features. Far fewer parameters than XGBoost, so it cannot
+# over-fit weak channels into noise; in practice mf dominates the learned weights
+# (hence "mf-centric"). Kept as an A/B contender — the training job ships whichever
+# of {xgboost, linear} wins NDCG@10 on the held-out split. Robust floor.
+def train_linear_ranker(X, y, qid=None):
+    from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import StandardScaler
+    Xc = np.nan_to_num(X.astype(np.float64), nan=0.0)
+    scaler = StandardScaler().fit(Xc)
+    model = Ridge(alpha=1.0)
+    model.fit(scaler.transform(Xc), y.astype(np.float64))
+    return {"scaler": scaler, "coef": model.coef_, "intercept": float(model.intercept_)}
+
+
+class LinearRanker:
+    """Same predict(X) interface as XgbRanker so _rank/_evaluate are agnostic."""
+
+    KIND = "linear"
+
+    def __init__(self, data: dict, path: str | None = None):
+        self.model = data["model"]            # {scaler, coef, intercept}
+        self.features = data.get("features", FEATURE_NAMES)
+        self.meta = data.get("meta", {})
+        self.path = path
+
+    @classmethod
+    def load(cls, path: str) -> "LinearRanker":
+        return cls(joblib.load(path), path=path)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        m = self.model
+        Xc = np.nan_to_num(X.astype(np.float64), nan=0.0)
+        return (m["scaler"].transform(Xc) @ m["coef"] + m["intercept"]).astype(np.float32)
+
+
+def save_linear_ranker(model: dict, meta: dict) -> tuple[str, str]:
+    config.RANKER_DIR.mkdir(parents=True, exist_ok=True)
+    version = "lin_" + time.strftime("%Y%m%d_%H%M%S")
+    path = config.RANKER_DIR / f"{version}.joblib"
+    tmp = path.with_suffix(".joblib.tmp")
+    joblib.dump({"model": model, "features": FEATURE_NAMES, "meta": meta, "kind": "linear"}, tmp)
+    os.replace(tmp, path)
+    return version, str(path)
+
+
 def save_ranker(model, meta: dict) -> tuple[str, str]:
     config.RANKER_DIR.mkdir(parents=True, exist_ok=True)
     version = "xgb_" + time.strftime("%Y%m%d_%H%M%S")
     path = config.RANKER_DIR / f"{version}.joblib"
     tmp = path.with_suffix(".joblib.tmp")
-    joblib.dump({"model": model, "features": FEATURE_NAMES, "meta": meta}, tmp)
+    joblib.dump({"model": model, "features": FEATURE_NAMES, "meta": meta, "kind": "xgboost"}, tmp)
     os.replace(tmp, path)
     return version, str(path)
 
 
+def load_ranker(path: str):
+    """Load the active ranker artifact as the right class (xgboost | linear)."""
+    data = joblib.load(path)
+    if data.get("kind") == "linear":
+        return LinearRanker(data, path=path)
+    return XgbRanker(data, path=path)
+
+
 class XgbRanker:
+    KIND = "xgboost"
+
     def __init__(self, data: dict, path: str | None = None):
         self.model = data["model"]
         self.features = data.get("features", FEATURE_NAMES)
