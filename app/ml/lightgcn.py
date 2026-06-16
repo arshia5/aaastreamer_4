@@ -11,9 +11,14 @@ at this scale (~82k users, ~31k items, ~1.1M edges).
 """
 from __future__ import annotations
 
+import logging
+import time
+
 import numpy as np
 
 from app.ml import config
+
+log = logging.getLogger("recsys.lightgcn")
 
 
 def _device():
@@ -57,8 +62,11 @@ def train_lightgcn(
     deg_inv_sqrt = deg.pow(-0.5)
     deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
     vals = deg_inv_sqrt[src] * deg_inv_sqrt[dst]
-    adj = torch.sparse_coo_tensor(
-        torch.stack([src, dst]), vals, (n, n)).coalesce().to(dev)
+    # indices are constructed well-formed; explicitly opt out of the invariant
+    # check (via the global toggle) to silence the implicit-disable UserWarning.
+    with torch.sparse.check_sparse_tensor_invariants(False):
+        adj = torch.sparse_coo_tensor(
+            torch.stack([src, dst]), vals, (n, n)).coalesce().to(dev)
 
     E0 = torch.nn.Parameter(torch.empty(n, dim, device=dev))
     torch.nn.init.normal_(E0, std=0.1)
@@ -76,7 +84,11 @@ def train_lightgcn(
             out = out + e_k
         return out / (layers + 1)
 
-    for _ in range(epochs):
+    log.info("LightGCN training: %d epochs on %s (%d users, %d items, %d edges)",
+             epochs, dev, n_users, n_items, e)
+    log_every = max(1, epochs // 10)
+    t0 = time.time()
+    for ep in range(epochs):
         out = propagate()
         u = out[pu]
         ip = out[pi]
@@ -92,6 +104,9 @@ def train_lightgcn(
         loss.backward()
         opt.step()
         losses.append(loss.item())
+        if (ep + 1) % log_every == 0 or ep == epochs - 1:
+            log.info("  epoch %d/%d  loss=%.4f  (%.1fs elapsed)",
+                     ep + 1, epochs, losses[-1], time.time() - t0)
 
     with torch.no_grad():
         final = propagate().cpu().numpy().astype(np.float32)

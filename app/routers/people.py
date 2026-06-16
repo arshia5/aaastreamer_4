@@ -14,8 +14,15 @@ from sqlalchemy.exc import IntegrityError
 
 from app.deps import DB, CurrentAdmin, PageParams
 from app.integrations import tmdb
-from app.models import Person
-from app.schemas import Message, NamedCreate, NamedRead, NamedUpdate, PersonDetail
+from app.models import Movie, MoviePerson, Person
+from app.schemas import (
+    Message,
+    MovieRead,
+    NamedCreate,
+    NamedRead,
+    NamedUpdate,
+    PersonDetail,
+)
 
 router = APIRouter(prefix="/people", tags=["people"])
 
@@ -77,6 +84,34 @@ async def get_person(person_id: int, db: DB):
         raise HTTPException(status_code=404, detail="people not found")
     await _enrich_from_tmdb(db, person)
     return _to_detail(person)
+
+
+@router.get("/{person_id}/movies", response_model=list[MovieRead])
+async def list_person_movies(
+    person_id: int,
+    db: DB,
+    page: PageParams,
+    role_id: int | None = Query(
+        default=None, description="Filter to a single role (e.g. actor, director)"),
+):
+    """All movies this person is credited on, newest first. Optionally filter by
+    role_id (a person credited in several roles on one film appears once)."""
+    if await db.get(Person, person_id) is None:
+        raise HTTPException(status_code=404, detail="people not found")
+    stmt = (
+        select(Movie)
+        .join(MoviePerson, MoviePerson.movie_id == Movie.id)
+        .where(MoviePerson.person_id == person_id)
+    )
+    if role_id is not None:
+        stmt = stmt.where(MoviePerson.role_id == role_id)
+    stmt = (
+        stmt.distinct()
+        .order_by(Movie.year.desc().nulls_last(), Movie.movie_title)
+        .limit(page.limit)
+        .offset(page.offset)
+    )
+    return (await db.execute(stmt)).scalars().all()
 
 
 @router.post("", response_model=NamedRead, status_code=status.HTTP_201_CREATED)
