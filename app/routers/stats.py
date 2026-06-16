@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import Integer, cast, func, select
+from sqlalchemy import Integer, cast, func, select, text
 
 from app.deps import DB, CurrentAdmin, CurrentUser
 from app.ml.evaluation import compute_metrics, fetch_eval_data
@@ -17,6 +17,7 @@ from app.models import (
     UserMovieState,
     UserMovieStateType,
 )
+from app.ml import config
 from app.schemas import (
     CountItem,
     GenreCount,
@@ -25,6 +26,7 @@ from app.schemas import (
     RatedMovie,
     RatingDistributionBucket,
     RecommendationEvaluation,
+    TrendingMovie,
     UserStats,
 )
 
@@ -116,26 +118,106 @@ async def top_rated_movies(
     limit: int = Query(default=10, ge=1, le=100),
     min_ratings: int = Query(default=1, ge=1, description="Minimum number of ratings"),
 ):
-    avg_rating = func.avg(Interaction.rating).label("average_rating")
-    rating_count = func.count(Interaction.rating).label("rating_count")
-    stmt = (
-        select(Movie.id, Movie.movie_title, avg_rating, rating_count)
-        .join(Interaction, Interaction.movie_id == Movie.id)
-        .where(Interaction.rating.is_not(None))
-        .group_by(Movie.id, Movie.movie_title)
-        .having(func.count(Interaction.rating) >= min_ratings)
-        .order_by(avg_rating.desc())
-        .limit(limit)
+    """Highest-quality movies by a Bayesian-weighted score.
+
+    Ranks by  (PRIOR*global_mean + sum(preference_score)) / (PRIOR + n)  rather
+    than the naive average, so a handful of 10/10 reviews can't outrank a film
+    with thousands of consistently-strong ones. `score` is that weighted value;
+    `average_rating` is the honest raw mean shown alongside it.
+    """
+    sql = text(
+        f"""
+        WITH gm AS (SELECT avg(preference_score) AS m FROM interactions)
+        SELECT m.id, m.movie_title,
+               avg(i.rating) AS average_rating,
+               count(i.preference_score) AS rating_count,
+               ({config.POPULARITY_PRIOR} * (SELECT m FROM gm)
+                + coalesce(sum(i.preference_score), 0))
+               / ({config.POPULARITY_PRIOR} + count(i.preference_score)) AS score
+        FROM movies m
+        JOIN interactions i ON i.movie_id = m.id
+        WHERE i.preference_score IS NOT NULL
+        GROUP BY m.id, m.movie_title
+        HAVING count(i.preference_score) >= :min_ratings
+        ORDER BY score DESC
+        LIMIT :limit
+        """
     )
-    rows = (await db.execute(stmt)).all()
+    rows = (await db.execute(sql, {"min_ratings": min_ratings, "limit": limit})).all()
     return [
         RatedMovie(
-            id=mid,
-            movie_title=title,
-            average_rating=float(avg) if avg is not None else None,
-            rating_count=cnt,
+            id=r.id,
+            movie_title=r.movie_title,
+            average_rating=float(r.average_rating) if r.average_rating is not None else None,
+            rating_count=r.rating_count,
+            score=float(r.score) if r.score is not None else None,
         )
-        for mid, title, avg, cnt in rows
+        for r in rows
+    ]
+
+
+@router.get("/movies/trending", response_model=list[TrendingMovie])
+async def trending_movies(
+    db: DB,
+    limit: int = Query(default=10, ge=1, le=100),
+    window_days: int = Query(default=30, ge=1, le=365,
+                             description="Length of the recent window (days)"),
+    min_recent: int = Query(default=3, ge=1,
+                            description="Minimum reviews in the recent window to qualify"),
+):
+    """Movies gaining momentum (velocity), not just evergreen-popular ones.
+
+    The window is anchored to the most recent review_date in the data (the dataset
+    is historical, so wall-clock now() would match nothing). We compare the recent
+    `window_days` against the equally-long window before it:
+
+        trend_score = recent_count / (prior_count + k) * ln(1 + recent_count)
+
+    The ratio rewards acceleration; the ln(volume) term keeps a 2-review blip from
+    topping a genuine surge of hundreds.
+    """
+    k = 3  # smoothing: dampens divide-by-tiny-prior spikes
+    sql = text(
+        """
+        WITH anchor AS (
+            SELECT max(review_date) AS t FROM interactions WHERE review_date IS NOT NULL
+        ),
+        windows AS (
+            SELECT i.movie_id,
+                   count(*) FILTER (
+                       WHERE i.review_date > a.t - make_interval(days => :n)) AS recent_count,
+                   count(*) FILTER (
+                       WHERE i.review_date <= a.t - make_interval(days => :n)) AS prior_count,
+                   avg(i.preference_score) FILTER (
+                       WHERE i.review_date > a.t - make_interval(days => :n)) AS recent_avg_pref
+            FROM interactions i CROSS JOIN anchor a
+            WHERE i.review_date IS NOT NULL
+              AND i.review_date > a.t - make_interval(days => 2 * :n)
+            GROUP BY i.movie_id
+        )
+        SELECT m.id, m.movie_title, w.recent_count, w.prior_count, w.recent_avg_pref,
+               (w.recent_count::float / (w.prior_count + :k))
+               * ln(1 + w.recent_count) AS trend_score
+        FROM windows w
+        JOIN movies m ON m.id = w.movie_id
+        WHERE w.recent_count >= :min_recent
+        ORDER BY trend_score DESC
+        LIMIT :limit
+        """
+    )
+    rows = (await db.execute(
+        sql, {"n": window_days, "k": k, "min_recent": min_recent, "limit": limit})).all()
+    return [
+        TrendingMovie(
+            id=r.id,
+            movie_title=r.movie_title,
+            recent_count=r.recent_count,
+            prior_count=r.prior_count,
+            recent_avg_preference=(
+                float(r.recent_avg_pref) if r.recent_avg_pref is not None else None),
+            trend_score=float(r.trend_score),
+        )
+        for r in rows
     ]
 
 

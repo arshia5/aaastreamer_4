@@ -403,6 +403,20 @@ class RatedMovie(BaseModel):
     movie_title: str
     average_rating: float | None = None
     rating_count: int = 0
+    # Bayesian-weighted quality score used for ranking (top-rated). None for the
+    # legacy count-based endpoints that don't compute it.
+    score: float | None = None
+
+
+class TrendingMovie(BaseModel):
+    """A movie ranked by recent momentum (velocity). Windows are anchored to the
+    latest review_date in the data, not wall-clock now."""
+    id: int
+    movie_title: str
+    recent_count: int
+    prior_count: int
+    recent_avg_preference: float | None = None
+    trend_score: float
 
 
 class GenreCount(BaseModel):
