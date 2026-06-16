@@ -13,6 +13,7 @@ from app.schemas import (
     InteractionRead,
     InteractionUpdate,
     Message,
+    MovieReviewRead,
 )
 
 router = APIRouter(prefix="/interactions", tags=["interactions"])
@@ -86,6 +87,63 @@ async def list_my_interactions(db: DB, current_user: CurrentUser, page: PagePara
         .offset(page.offset)
     )
     return (await db.execute(stmt)).scalars().all()
+
+
+@router.get("/movie/{movie_id}", response_model=list[MovieReviewRead])
+async def list_movie_reviews(
+    movie_id: int,
+    db: DB,
+    current_user: CurrentUser,
+    page: PageParams,
+    with_text_only: bool = Query(
+        default=True, description="Only return interactions that have review text"),
+):
+    """Other users' reviews for a movie (for the movie page). Available to any
+    logged-in user; exposes the author's username but not their email or the
+    internal ML scores. Newest first."""
+    await _ensure_movie(db, movie_id)
+    stmt = (
+        select(Interaction, User.username)
+        .join(User, User.id == Interaction.user_id)
+        .where(Interaction.movie_id == movie_id)
+    )
+    if with_text_only:
+        stmt = stmt.where(func.length(func.trim(Interaction.review_body)) > 0)
+    stmt = (
+        stmt.order_by(
+            func.coalesce(Interaction.review_date, Interaction.created_at).desc())
+        .limit(page.limit)
+        .offset(page.offset)
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        MovieReviewRead(
+            id=i.id,
+            user_id=i.user_id,
+            username=username,
+            rating=i.rating,
+            review_title=i.review_title,
+            review_body=i.review_body,
+            review_date=i.review_date,
+            created_at=i.created_at,
+        )
+        for i, username in rows
+    ]
+
+
+@router.get("/me/{movie_id}", response_model=InteractionRead)
+async def get_my_interaction(movie_id: int, db: DB, current_user: CurrentUser):
+    """The current user's own interaction for a movie (for the movie page).
+
+    Returns 404 if they haven't reviewed/rated it yet. Available to any logged-in
+    user — unlike the admin-only movie_id filter on `GET /interactions`."""
+    stmt = select(Interaction).where(
+        Interaction.user_id == current_user.id, Interaction.movie_id == movie_id
+    )
+    interaction = (await db.execute(stmt)).scalar_one_or_none()
+    if interaction is None:
+        raise HTTPException(status_code=404, detail="No interaction for this movie")
+    return interaction
 
 
 @router.post(

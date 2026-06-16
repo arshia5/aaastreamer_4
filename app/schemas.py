@@ -186,6 +186,20 @@ class InteractionRead(BaseModel):
     updated_at: datetime
 
 
+class MovieReviewRead(BaseModel):
+    """A public-facing review for a movie page: the review content plus the
+    author's username. Internal ML signals (sentiment, preference_score) and the
+    author's email are deliberately omitted."""
+    id: int
+    user_id: int
+    username: str
+    rating: float | None
+    review_title: str | None
+    review_body: str | None
+    review_date: datetime | None
+    created_at: datetime
+
+
 # --------------------------------------------------------------------------- #
 # User movie state (watched / watchlist)
 # --------------------------------------------------------------------------- #
