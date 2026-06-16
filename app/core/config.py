@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     # Embeddings
     embedding_dim: int = 390
 
+    # TMDB (used to lazily enrich people biographies & movie collections)
+    tmdb_api_key: str = ""
+
     # App
     project_name: str = "aaastreamer API"
     cors_origins: str = "*"

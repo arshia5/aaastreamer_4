@@ -1,11 +1,15 @@
+from datetime import datetime
+
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from app.deps import DB, CurrentAdmin, PageParams
+from app.integrations import tmdb
 from app.ml.movie_refresh import schedule_movie_refresh
 from app.models import (
+    Collection,
     Country,
     Genre,
     Language,
@@ -18,6 +22,7 @@ from app.models import (
     Role,
 )
 from app.schemas import (
+    CollectionRead,
     Message,
     MovieCreate,
     MovieDetail,
@@ -115,6 +120,112 @@ async def get_movie(movie_id: int, db: DB):
     if movie is None:
         raise HTTPException(status_code=404, detail="Movie not found")
     return movie
+
+
+# --------------------------------------------------------------------------- #
+# TMDB collection (lazily fetched + cached on first view)
+# --------------------------------------------------------------------------- #
+async def _upsert_collection(db: DB, data: dict) -> None:
+    """Insert/update the collections row from TMDB collection detail."""
+    coll = await db.get(Collection, data["id"])
+    if coll is None:
+        coll = Collection(id=data["id"], name=data.get("name") or "")
+        db.add(coll)
+    coll.name = data.get("name") or coll.name
+    coll.overview = data.get("overview") or None
+    coll.poster_path = data.get("poster_path")
+    coll.backdrop_path = data.get("backdrop_path")
+
+
+async def _map_collection_members(db: DB, collection_id: int, parts: list[dict]) -> None:
+    """Link any collection members that already exist in our catalogue.
+
+    Matches by TMDB id first, then by (title, year). Members not in our DB are
+    simply skipped — we only surface films we actually have."""
+    now = datetime.utcnow()
+    for part in parts:
+        part_tmdb_id = part.get("id")
+        movie = None
+        if part_tmdb_id is not None:
+            movie = await db.scalar(select(Movie).where(Movie.tmdb_id == part_tmdb_id))
+        if movie is None:
+            title = (part.get("title") or "").strip()
+            if not title:
+                continue
+            rel = part.get("release_date") or ""
+            year = int(rel[:4]) if rel[:4].isdigit() else None
+            stmt = select(Movie).where(func.lower(Movie.movie_title) == title.lower())
+            if year is not None:
+                stmt = stmt.where(Movie.year == year)
+            movie = await db.scalar(stmt.limit(1))
+        if movie is not None:
+            # We now know this movie's collection — cache it so clicking it later
+            # doesn't re-query TMDB.
+            movie.tmdb_id = part_tmdb_id
+            movie.tmdb_collection_id = collection_id
+            movie.tmdb_checked_at = now
+
+
+async def _resolve_collection(db: DB, movie: Movie) -> None:
+    """On first view, resolve the movie's TMDB collection and cache it.
+
+    `tmdb_checked_at` is set only on a successful TMDB response (collection found
+    *or* confirmed absent), so a movie with no collection isn't re-queried while
+    transient network errors still retry."""
+    if movie.tmdb_checked_at is not None or not tmdb.enabled():
+        return
+    try:
+        tmdb_id = movie.tmdb_id
+        if tmdb_id is None:
+            summary = await tmdb.find_movie_by_imdb(movie.imdb_id)
+            tmdb_id = summary["id"] if summary else None
+        detail = await tmdb.get_movie(tmdb_id) if tmdb_id else None
+        belongs = (detail or {}).get("belongs_to_collection")
+        coll_data = await tmdb.get_collection(belongs["id"]) if belongs else None
+    except tmdb.TMDBError:
+        return  # transient — retry on next view, don't poison the cache
+    movie.tmdb_checked_at = datetime.utcnow()
+    if tmdb_id is not None:
+        movie.tmdb_id = tmdb_id
+    if coll_data:
+        await _upsert_collection(db, coll_data)
+        await _map_collection_members(db, coll_data["id"], coll_data.get("parts") or [])
+        movie.tmdb_collection_id = coll_data["id"]
+    await db.commit()
+    await db.refresh(movie)
+
+
+@router.get("/{movie_id}/collection", response_model=CollectionRead | None)
+async def movie_collection(movie_id: int, db: DB):
+    """The movie's TMDB collection with the member films we have in our catalogue,
+    or `null` if it doesn't belong to one. Fetched from TMDB on first view, cached
+    thereafter (including the 'no collection' result)."""
+    movie = await db.get(Movie, movie_id)
+    if movie is None:
+        raise HTTPException(status_code=404, detail="Movie not found")
+    await _resolve_collection(db, movie)
+    if movie.tmdb_collection_id is None:
+        return None
+    coll = await db.get(Collection, movie.tmdb_collection_id)
+    if coll is None:
+        return None
+    members = (
+        await db.execute(
+            select(Movie)
+            .where(Movie.tmdb_collection_id == coll.id)
+            .order_by(Movie.year.asc().nulls_last(), Movie.movie_title.asc())
+        )
+    ).scalars().all()
+    return CollectionRead(
+        id=coll.id,
+        name=coll.name,
+        overview=coll.overview,
+        poster_path=coll.poster_path,
+        poster_url=tmdb.image_url(coll.poster_path),
+        backdrop_path=coll.backdrop_path,
+        backdrop_url=tmdb.image_url(coll.backdrop_path, "w780"),
+        movies=members,
+    )
 
 
 @router.post("", response_model=MovieRead, status_code=status.HTTP_201_CREATED)

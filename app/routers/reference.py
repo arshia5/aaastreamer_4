@@ -3,7 +3,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.deps import DB, CurrentAdmin, PageParams
-from app.models import Country, Genre, Language, Person, Role
+from app.models import Country, Genre, Language, Role
 from app.schemas import Message, NamedCreate, NamedRead, NamedUpdate
 
 
@@ -77,7 +77,8 @@ def build_reference_router(model, name: str, tag: str) -> APIRouter:
     return router
 
 
-people_router = build_reference_router(Person, "people", "people")
+# NOTE: people are served by app.routers.people (TMDB-enriched), not the generic
+# factory — see app/main.py.
 roles_router = build_reference_router(Role, "roles", "roles")
 countries_router = build_reference_router(Country, "countries", "countries")
 genres_router = build_reference_router(Genre, "genres", "genres")

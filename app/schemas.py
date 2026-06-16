@@ -115,6 +115,39 @@ class MovieDetail(MovieRead):
 
 
 # --------------------------------------------------------------------------- #
+# People (TMDB-enriched)
+# --------------------------------------------------------------------------- #
+class PersonDetail(BaseModel):
+    """A person plus lazily-fetched TMDB biography fields. `profile_url` is a
+    ready-to-use image URL built from the stored TMDB path."""
+    model_config = ORM
+    id: int
+    name: str
+    tmdb_id: int | None = None
+    biography: str | None = None
+    profile_path: str | None = None
+    profile_url: str | None = None
+    birthday: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Collections (TMDB-enriched)
+# --------------------------------------------------------------------------- #
+class CollectionRead(BaseModel):
+    """A TMDB collection plus the member movies that exist in our catalogue.
+    `movies` only contains films we actually have; absent members are omitted."""
+    model_config = ORM
+    id: int
+    name: str
+    overview: str | None = None
+    poster_path: str | None = None
+    poster_url: str | None = None
+    backdrop_path: str | None = None
+    backdrop_url: str | None = None
+    movies: list[MovieRead] = []
+
+
+# --------------------------------------------------------------------------- #
 # Interactions
 # --------------------------------------------------------------------------- #
 class InteractionInput(BaseModel):

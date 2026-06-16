@@ -15,6 +15,7 @@ from app.routers import (
     interactions,
     logs,
     movies,
+    people,
     recommendations,
     reference,
     stats,
@@ -88,7 +89,7 @@ app.include_router(auth.router)
 app.include_router(users.router)
 
 # Reference / lookup tables
-app.include_router(reference.people_router)
+app.include_router(people.router)  # people = enriched (TMDB biographies)
 app.include_router(reference.roles_router)
 app.include_router(reference.countries_router)
 app.include_router(reference.genres_router)

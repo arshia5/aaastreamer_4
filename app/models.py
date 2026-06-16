@@ -38,6 +38,13 @@ class Person(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    # TMDB enrichment (lazily fetched on first profile view, then cached).
+    tmdb_id: Mapped[int | None] = mapped_column(Integer)
+    biography: Mapped[str | None] = mapped_column(Text)
+    profile_path: Mapped[str | None] = mapped_column(String)  # TMDB image path
+    birthday: Mapped[str | None] = mapped_column(String)  # ISO date 'YYYY-MM-DD'
+    # Set once we've queried TMDB (even on a miss) so we never re-spam the API.
+    tmdb_checked_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class Role(Base):
@@ -81,6 +88,14 @@ class Movie(Base):
     duration: Mapped[int | None] = mapped_column(Integer)
     plot: Mapped[str | None] = mapped_column(Text)
     poster_url: Mapped[str | None] = mapped_column(String)
+    # TMDB linkage (lazily resolved on first collection view, then cached).
+    tmdb_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    tmdb_collection_id: Mapped[int | None] = mapped_column(
+        ForeignKey("collections.id", ondelete="SET NULL"), index=True
+    )
+    # Set once we've queried TMDB for this movie's collection (even on a miss),
+    # so a movie with no collection isn't re-checked against the API every click.
+    tmdb_checked_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )
@@ -96,6 +111,26 @@ class Movie(Base):
     )
     languages: Mapped[list[Language]] = relationship(
         secondary="movie_languages", lazy="selectin"
+    )
+
+
+class Collection(Base):
+    """A TMDB movie collection (e.g. "The Matrix Collection"). `id` is the TMDB
+    collection id. Members are `movies` rows whose `tmdb_collection_id` points
+    here — we only surface members that already exist in our catalogue."""
+
+    __tablename__ = "collections"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    overview: Mapped[str | None] = mapped_column(Text)
+    poster_path: Mapped[str | None] = mapped_column(String)
+    backdrop_path: Mapped[str | None] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
 
