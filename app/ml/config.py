@@ -53,6 +53,25 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACTS_DIR = _PROJECT_ROOT / "artifacts"
 PIPELINE_PATH = ARTIFACTS_DIR / "movie_embed_pipeline.joblib"
 
+
+def resolve_artifact_path(path) -> str:
+    """Map a stored artifact path onto the current machine.
+
+    `model_versions.artifact_path` is persisted as the absolute path used at
+    training time, so a model trained on another device (or before a move) points
+    at a directory that doesn't exist here. If the stored path is missing, re-root
+    it under the local ARTIFACTS_DIR by its position relative to the 'artifacts'
+    path segment, falling back to the bare filename under artifacts/.
+    """
+    p = Path(path)
+    if p.exists():
+        return str(p)
+    parts = p.parts
+    if "artifacts" in parts:
+        rel = Path(*parts[parts.index("artifacts") + 1:])
+        return str(ARTIFACTS_DIR / rel)
+    return str(ARTIFACTS_DIR / p.name)
+
 # Default training CSV (the original dataset).
 DEFAULT_MOVIES_CSV = _PROJECT_ROOT.parent / "aaastreamer_3" / "data" / "movies.csv"
 

@@ -297,6 +297,14 @@ class UserRecommendationRead(BaseModel):
     updated_at: datetime
 
 
+class BecauseYouEnjoyedRead(BaseModel):
+    """A "Because you enjoyed <movie>" carousel: the source movie the user last
+    rated highly, plus movies similar to it (excluding ones they've already seen)."""
+    source_movie: MovieRead
+    preference_score: float | None = None
+    movies: list[MovieRead] = []
+
+
 # --------------------------------------------------------------------------- #
 # Movie associations (genres/countries/languages/people)
 # --------------------------------------------------------------------------- #

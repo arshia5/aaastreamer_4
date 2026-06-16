@@ -133,6 +133,7 @@ class CollaborativeModel:
 
     @classmethod
     def load(cls, path: str) -> "CollaborativeModel":
+        path = config.resolve_artifact_path(path)
         return cls(joblib.load(path), path=path)
 
     def has_user(self, user_id: int) -> bool:

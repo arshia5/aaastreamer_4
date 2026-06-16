@@ -188,6 +188,7 @@ def save_ranker(model, meta: dict) -> tuple[str, str]:
 
 def load_ranker(path: str):
     """Load the active ranker artifact as the right class (xgboost | linear)."""
+    path = config.resolve_artifact_path(path)
     data = joblib.load(path)
     if data.get("kind") == "linear":
         return LinearRanker(data, path=path)
