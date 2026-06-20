@@ -518,6 +518,34 @@ class MoviePopularityStats(Base):
     )
 
 
+class MovieTrendingStats(Base):
+    """Precomputed velocity score per movie, refreshed by the nightly job.
+
+    trend_score is genre-independent, so both "all trending" and "by genre
+    trending" read this one row per movie (genre filtering is a join on
+    movie_genres). The window is anchored to max(review_date), not now().
+    """
+    __tablename__ = "movie_trending_stats"
+
+    movie_id: Mapped[int] = mapped_column(
+        ForeignKey("movies.id", ondelete="CASCADE"), primary_key=True
+    )
+    recent_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    prior_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    recent_avg_preference: Mapped[float | None] = mapped_column(Double)
+    trend_score: Mapped[float] = mapped_column(
+        Double, nullable=False, server_default="0"
+    )
+    window_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class ModelVersion(Base):
     __tablename__ = "model_versions"
 

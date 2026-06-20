@@ -433,6 +433,12 @@ class TrendingMovie(BaseModel):
     trend_score: float
 
 
+class TrendingRecompute(BaseModel):
+    """Result of an on-demand movie_trending_stats rebuild."""
+    movies_scored: int
+    window_days: int
+
+
 class GenreCount(BaseModel):
     genre_id: int
     name: str

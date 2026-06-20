@@ -158,6 +158,16 @@ CF_PARTIAL_BLEND = 0.30      # new = 0.30*updated + 0.70*nightly_factor
 # (PRIOR*global_mean + sum) / (PRIOR + n). Avoids low-count averages dominating.
 POPULARITY_PRIOR = 50
 
+# --- Trending (velocity) precompute --------------------------------------- #
+# Length of the recent window, in days, used when recomputing movie_trending_stats.
+# The window is anchored to max(review_date) in the data (the dataset is
+# historical), not wall-clock now(); we compare the recent window against the
+# equally-long window before it. Smoothing k dampens divide-by-tiny-prior spikes.
+TRENDING_WINDOW_DAYS = 30
+TRENDING_SMOOTHING_K = 3
+# Min reviews in the recent window for a movie to be stored as "trending".
+TRENDING_MIN_RECENT = 3
+
 # --- Hybrid scoring weights ----------------------------------------------- #
 HYBRID_W_COLLAB = 0.45
 HYBRID_W_CONTENT = 0.35

@@ -4,6 +4,7 @@ from sqlalchemy import Integer, cast, func, select, text
 
 from app.deps import DB, CurrentAdmin, CurrentUser
 from app.ml.evaluation import compute_metrics, fetch_eval_data
+from app.ml.trending import recompute_trending
 from app.models import (
     Country,
     Genre,
@@ -27,6 +28,7 @@ from app.schemas import (
     RatingDistributionBucket,
     RecommendationEvaluation,
     TrendingMovie,
+    TrendingRecompute,
     UserStats,
 )
 
@@ -159,54 +161,41 @@ async def top_rated_movies(
 @router.get("/movies/trending", response_model=list[TrendingMovie])
 async def trending_movies(
     db: DB,
-    limit: int = Query(default=10, ge=1, le=100),
-    window_days: int = Query(default=30, ge=1, le=365,
-                             description="Length of the recent window (days)"),
-    min_recent: int = Query(default=3, ge=1,
-                            description="Minimum reviews in the recent window to qualify"),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    genre_id: int | None = Query(default=None, description="Filter to a specific genre"),
 ):
     """Movies gaining momentum (velocity), not just evergreen-popular ones.
 
-    The window is anchored to the most recent review_date in the data (the dataset
-    is historical, so wall-clock now() would match nothing). We compare the recent
-    `window_days` against the equally-long window before it:
+    Reads precomputed scores from movie_trending_stats (refreshed by the nightly
+    training job, app.ml.trending). The score compares a recent window against the
+    equally-long window before it, anchored to the latest review_date in the data
+    (the dataset is historical, so wall-clock now() would match nothing):
 
         trend_score = recent_count / (prior_count + k) * ln(1 + recent_count)
 
-    The ratio rewards acceleration; the ln(volume) term keeps a 2-review blip from
-    topping a genuine surge of hundreds.
+    The score is genre-independent, so `genre_id` just filters via movie_genres;
+    the ranking is the same stored score either way. Page with limit + offset.
     """
-    k = 3  # smoothing: dampens divide-by-tiny-prior spikes
+    genre_join = (
+        "JOIN movie_genres mg ON mg.movie_id = t.movie_id AND mg.genre_id = :genre_id"
+        if genre_id is not None else ""
+    )
     sql = text(
-        """
-        WITH anchor AS (
-            SELECT max(review_date) AS t FROM interactions WHERE review_date IS NOT NULL
-        ),
-        windows AS (
-            SELECT i.movie_id,
-                   count(*) FILTER (
-                       WHERE i.review_date > a.t - make_interval(days => :n)) AS recent_count,
-                   count(*) FILTER (
-                       WHERE i.review_date <= a.t - make_interval(days => :n)) AS prior_count,
-                   avg(i.preference_score) FILTER (
-                       WHERE i.review_date > a.t - make_interval(days => :n)) AS recent_avg_pref
-            FROM interactions i CROSS JOIN anchor a
-            WHERE i.review_date IS NOT NULL
-              AND i.review_date > a.t - make_interval(days => 2 * :n)
-            GROUP BY i.movie_id
-        )
-        SELECT m.id, m.movie_title, w.recent_count, w.prior_count, w.recent_avg_pref,
-               (w.recent_count::float / (w.prior_count + :k))
-               * ln(1 + w.recent_count) AS trend_score
-        FROM windows w
-        JOIN movies m ON m.id = w.movie_id
-        WHERE w.recent_count >= :min_recent
-        ORDER BY trend_score DESC
-        LIMIT :limit
+        f"""
+        SELECT m.id, m.movie_title, t.recent_count, t.prior_count,
+               t.recent_avg_preference, t.trend_score
+        FROM movie_trending_stats t
+        JOIN movies m ON m.id = t.movie_id
+        {genre_join}
+        ORDER BY t.trend_score DESC
+        LIMIT :limit OFFSET :offset
         """
     )
-    rows = (await db.execute(
-        sql, {"n": window_days, "k": k, "min_recent": min_recent, "limit": limit})).all()
+    params = {"limit": limit, "offset": offset}
+    if genre_id is not None:
+        params["genre_id"] = genre_id
+    rows = (await db.execute(sql, params)).all()
     return [
         TrendingMovie(
             id=r.id,
@@ -214,11 +203,24 @@ async def trending_movies(
             recent_count=r.recent_count,
             prior_count=r.prior_count,
             recent_avg_preference=(
-                float(r.recent_avg_pref) if r.recent_avg_pref is not None else None),
+                float(r.recent_avg_preference)
+                if r.recent_avg_preference is not None else None),
             trend_score=float(r.trend_score),
         )
         for r in rows
     ]
+
+
+@router.post("/movies/trending/recompute", response_model=TrendingRecompute)
+async def recompute_trending_stats(db: DB, _: CurrentAdmin):
+    """Rebuild movie_trending_stats on demand (admin only).
+
+    The nightly training job already refreshes this; use this when you want the
+    scores updated without waiting for the next run. Anchors the window to the
+    latest review_date in the data, same as the job.
+    """
+    count = await recompute_trending(db)
+    return TrendingRecompute(movies_scored=count, window_days=config.TRENDING_WINDOW_DAYS)
 
 
 @router.get("/movies/most-rated", response_model=list[RatedMovie])

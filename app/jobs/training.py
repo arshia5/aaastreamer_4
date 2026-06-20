@@ -84,6 +84,14 @@ async def run_full_recommendation_training(
         await conn.execute(_RECOMPUTE_SQL.text)
         metrics["popularity_seconds"] = round(time.time() - ts, 1)
 
+        # trending velocity scores (genre-independent; read by the stats endpoint)
+        from app.ml.trending import _DELETE_SQL as _TREND_DELETE_SQL
+        from app.ml.trending import _INSERT_SQL as _TREND_INSERT_SQL
+        ts = time.time()
+        await conn.execute(_TREND_DELETE_SQL.text)
+        await conn.execute(_TREND_INSERT_SQL.text)
+        metrics["trending_seconds"] = round(time.time() - ts, 1)
+
         # refresh community clusters for movies with new reviews (uses stored
         # review vectors, no re-embedding)
         from app.ml.community import rebuild_dirty_community
